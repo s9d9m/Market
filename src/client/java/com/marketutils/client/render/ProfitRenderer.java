@@ -1,7 +1,10 @@
 package com.marketutils.client.render;
 
+import com.marketutils.client.util.MarketUtilsConfig;
 import com.marketutils.client.util.PriceParser;
 import com.marketutils.client.util.PriceProvider;
+import com.marketutils.client.util.PriceSource;
+import com.marketutils.client.util.PricingMode;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.world.inventory.Slot;
@@ -16,10 +19,10 @@ import java.util.Map;
 
 /**
  * Evaluates whether auction items are worth buying by comparing listing price
- * to an estimated value sourced via PriceProvider (COFL median, SkyBlocker,
- * SkyHanni, or craft price, in that priority order). Renders a colored
- * BORDER around slots (so SkyHanni's rarity backgrounds remain visible) and
- * appends debug text to tooltips.
+ * to an estimated value sourced via PriceProvider, according to whichever
+ * PricingMode is currently selected in MarketUtilsConfig (see
+ * "/marketutils mode"). Renders a colored BORDER around slots (so SkyHanni's
+ * rarity backgrounds remain visible) and appends debug text to tooltips.
  *
  * Color scale is percentage-based:
  *   BIN far below estimated value  -> deep green border  (great deal)
@@ -150,10 +153,9 @@ public final class ProfitRenderer {
                 }
             }
 
-            // Estimated value comes from whichever compatible mod's line is
-            // present, in priority order: COFL median > SkyBlocker > SkyHanni
-            // > craft price. See PriceProvider for the priority chain.
-            estimatedValue = PriceProvider.findEstimatedValue(lines);
+            // Estimated value comes from whichever source the current
+            // PricingMode selects. See PriceProvider/PricingMode.
+            estimatedValue = PriceProvider.resolveValue(lines, MarketUtilsConfig.getMode());
         }
 
         if (price > 0L && estimatedValue > 0L) {
@@ -179,6 +181,47 @@ public final class ProfitRenderer {
             }
             lines.add(Component.literal(text));
 
+        }
+
+        if (MarketUtilsConfig.getMode() == PricingMode.DEBUG) {
+            appendDebugBreakdown(stack, lines, price);
+        }
+    }
+
+    /**
+     * DEBUG mode: shows every source's raw value side by side, which one
+     * AUTO would have picked, and the profit against that selection - for
+     * comparing sources against each other, not for changing the border
+     * grading (which still uses PriceProvider.resolveValue like every other
+     * mode).
+     */
+    private static void appendDebugBreakdown(ItemStack stack, List<Component> lines, long price) {
+        List<Component> fullTooltipLines = fetchFullTooltipLines(stack);
+        if (fullTooltipLines.isEmpty()) {
+            return;
+        }
+
+        Map<PriceSource, Long> values = PriceProvider.findAllValues(fullTooltipLines);
+        PriceSource selected = PriceProvider.findAutoSource(fullTooltipLines);
+
+        lines.add(Component.literal("\u00A76--- MarketUtils Debug ---"));
+        for (PriceSource source : PriceSource.values()) {
+            long value = values.getOrDefault(source, 0L);
+            String valueText = value > 0L ? formatAbsolute(value) : "N/A";
+            lines.add(Component.literal("\u00A77" + source.displayName() + ": \u00A7f" + valueText));
+        }
+
+        if (selected == null) {
+            lines.add(Component.literal("\u00A77Selected: \u00A7cNone"));
+            return;
+        }
+
+        lines.add(Component.literal("\u00A77Selected: \u00A7e" + selected.displayName()));
+
+        long selectedValue = values.get(selected);
+        if (price > 0L && selectedValue > 0L) {
+            long delta = selectedValue - price;
+            lines.add(Component.literal("\u00A77Estimated Profit: \u00A7f" + formatNumber(delta)));
         }
     }
 
@@ -206,16 +249,10 @@ public final class ProfitRenderer {
     // -- Internal evaluation --
 
     private static SlotProfitEntry evaluateFromTooltip(ItemStack stack, String fingerprint) {
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.level == null || mc.player == null) {
+        List<Component> tooltipLines = fetchFullTooltipLines(stack);
+        if (tooltipLines.isEmpty()) {
             return new SlotProfitEntry(fingerprint, 0L, 0L, 0);
         }
-
-        List<Component> tooltipLines = stack.getTooltipLines(
-                Item.TooltipContext.of(mc.level),
-                mc.player,
-                TooltipFlag.Default.NORMAL
-        );
 
         long price = 0L;
 
@@ -235,10 +272,9 @@ public final class ProfitRenderer {
             }
         }
 
-        // Estimated value comes from whichever compatible mod's line is
-        // present, in priority order: COFL median > SkyBlocker > SkyHanni
-        // > craft price. See PriceProvider for the priority chain.
-        long estimatedValue = PriceProvider.findEstimatedValue(tooltipLines);
+        // Estimated value comes from whichever source the current
+        // PricingMode selects. See PriceProvider/PricingMode.
+        long estimatedValue = PriceProvider.resolveValue(tooltipLines, MarketUtilsConfig.getMode());
 
         if (price <= 0L || estimatedValue <= 0L) {
             return new SlotProfitEntry(fingerprint, price, estimatedValue, 0);
@@ -246,6 +282,25 @@ public final class ProfitRenderer {
 
         int color = computeTintColor(price, estimatedValue);
         return new SlotProfitEntry(fingerprint, price, estimatedValue, color);
+    }
+
+    /**
+     * Independently fetches this stack's full tooltip, including lines
+     * added by every other mod (SkyHanni, COFL, etc.) regardless of
+     * ItemTooltipCallback registration order. Returns an empty list if the
+     * player/level aren't available yet.
+     */
+    private static List<Component> fetchFullTooltipLines(ItemStack stack) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) {
+            return List.of();
+        }
+
+        return stack.getTooltipLines(
+                Item.TooltipContext.of(mc.level),
+                mc.player,
+                TooltipFlag.Default.NORMAL
+        );
     }
 
     // -- Label matching --
@@ -379,5 +434,19 @@ public final class ProfitRenderer {
             return sign + String.format("%.1fK", absolute / 1_000.0);
         }
         return sign + absolute;
+    }
+
+    /** Same K/M/B formatting as formatNumber, without a forced +/- sign - for displaying a plain value rather than a delta. */
+    private static String formatAbsolute(long number) {
+        if (number >= 1_000_000_000L) {
+            return String.format("%.2fB", number / 1_000_000_000.0);
+        }
+        if (number >= 1_000_000L) {
+            return String.format("%.2fM", number / 1_000_000.0);
+        }
+        if (number >= 1_000L) {
+            return String.format("%.1fK", number / 1_000.0);
+        }
+        return String.valueOf(number);
     }
 }
