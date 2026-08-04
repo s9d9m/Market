@@ -4,7 +4,8 @@
 	"compatibilityLevel": "JAVA_21",
 	"client": [
 		"ExampleClientMixin",
-		"AbstractContainerScreenMixin"
+		"AbstractContainerScreenMixin",
+		"AbstractContainerMenuMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

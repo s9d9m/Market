@@ -63,6 +63,9 @@ public final class ProfitRenderer {
     private static volatile int hoveredSlotIndex = -1;
     private static Object currentScreenIdentity;
 
+    private static Object revisionTrackedMenu;
+    private static int lastSeenRevision = Integer.MIN_VALUE;
+
     private static volatile long scanStartNanos = System.nanoTime();
     private static volatile long scanCompletedNanos = 0L;
     private static volatile boolean scanComplete = false;
@@ -281,6 +284,28 @@ public final class ProfitRenderer {
     /** Called from the render mixin when inventorySlot == hoveredSlot. */
     public static void setHoveredSlotIndex(int index) {
         hoveredSlotIndex = index;
+    }
+
+    /**
+     * Called from the container-menu mixin every time the server pushes an
+     * item into this menu, with Minecraft's own sync revision number. A
+     * revision change for the SAME menu instance means the server just
+     * refreshed this menu's contents (e.g. an AH page flip that reuses the
+     * same open screen) - a reliable, cheap signal that doesn't depend on
+     * item display names, which can be identical between two different
+     * auctions of the same base item.
+     */
+    public static void onContainerRevisionSeen(Object menuInstance, int revision) {
+        if (revisionTrackedMenu != menuInstance) {
+            revisionTrackedMenu = menuInstance;
+            lastSeenRevision = revision;
+            return;
+        }
+
+        if (revision != lastSeenRevision) {
+            lastSeenRevision = revision;
+            clearCache();
+        }
     }
 
     private static void checkScanComplete() {
