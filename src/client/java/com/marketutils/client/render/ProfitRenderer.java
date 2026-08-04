@@ -254,12 +254,29 @@ public final class ProfitRenderer {
      */
     private static SlotProfitEntry findCachedEntryForStack(ItemStack stack) {
         String targetFingerprint = buildFingerprint(stack);
+        SlotProfitEntry match = null;
+
         for (SlotProfitEntry entry : SLOT_CACHE.values()) {
-            if (entry.fingerprint().equals(targetFingerprint)) {
-                return entry;
+            if (!entry.fingerprint().equals(targetFingerprint)) {
+                continue;
             }
+
+            if (match != null) {
+                // Multiple slots share this display name (a common AH page
+                // full of similar listings). There is no way to tell which
+                // one's cached data belongs to the item actually being
+                // hovered - appendTooltipText only receives an ItemStack,
+                // not a slot index - so showing either would risk
+                // presenting a DIFFERENT item's numbers as this one's.
+                // Bail out and let the caller fall back to scanning this
+                // item's own tooltip lines instead.
+                return null;
+            }
+
+            match = entry;
         }
-        return null;
+
+        return match;
     }
 
     // -- Internal evaluation --
