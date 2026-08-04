@@ -2,7 +2,7 @@ package com.marketutils.client.render;
 
 import com.marketutils.client.util.PriceParser;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractorExtractor;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.TooltipFlag;
@@ -56,7 +56,7 @@ public final class ProfitRenderer {
      * everything at the slot edges, leaving the center visible for rarity
      * backgrounds from SkyHanni and the item icon.
      */
-    public static void renderSlotBackground(GuiGraphics guiGraphics, Slot slot) {
+    public static void renderSlotBackground(GuiGraphicsExtractor guiGraphics, Slot slot) {
         if (slot == null) {
             return;
         }
@@ -300,7 +300,7 @@ public final class ProfitRenderer {
      * are drawn; the center area is untouched so SkyHanni's rarity
      * background and the item icon remain fully visible.
      */
-    private static void renderBorder(GuiGraphics g, Slot slot, int color) {
+    private static void renderBorder(GuiGraphicsExtractor g, Slot slot, int color) {
         if (color == 0) {
             return;
         }

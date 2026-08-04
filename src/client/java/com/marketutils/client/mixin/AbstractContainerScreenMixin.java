@@ -1,7 +1,7 @@
 package com.marketutils.client.mixin;
 
 import com.marketutils.client.render.ProfitRenderer;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.world.inventory.Slot;
@@ -32,8 +32,8 @@ public abstract class AbstractContainerScreenMixin {
      * so the profit border renders ON TOP of SkyHanni's rarity background
      * color and the item icon, but only at the thin 2px edges.
      */
-    @Inject(method = "renderSlot", at = @At("TAIL"))
-    private void injectProfitOverlay(GuiGraphics guiGraphics, Slot inventorySlot, CallbackInfo callbackInfo) {
+    @Inject(method = "extractSlot", at = @At("TAIL"))
+    private void injectProfitOverlay(GuiGraphicsExtractor guiGraphics, Slot inventorySlot, int i, int j, CallbackInfo callbackInfo) {
         if (inventorySlot == null) {
             return;
         }
