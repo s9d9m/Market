@@ -74,7 +74,31 @@ public final class ProfitRenderer {
     private static final int BORDER_THICKNESS = 2;
 
     private static final double NEUTRAL_BAND_PERCENT = 0.03;
-    private static final double MAX_SCALE_PERCENT = 0.50;
+
+    // 50%+ net margins essentially never happen on real AH flips (that
+    // would mean buying at under half real value), so a 0-50% scale
+    // squashed every realistic flip within a few percent of the neutral
+    // edge, making genuinely different-quality flips look nearly
+    // identical - and after switching profit calculations to NET (post-tax)
+    // margins, which run a few points lower than raw margins across the
+    // board, that compression got worse. 20% keeps the gradient meaningful
+    // across the range real flips actually fall in.
+    private static final double MAX_SCALE_PERCENT = 0.20;
+
+    private static final int NEUTRAL_ALPHA = 130;
+    private static final int NEUTRAL_R = 0xE0;
+    private static final int NEUTRAL_G = 0xD0;
+    private static final int NEUTRAL_B = 0x00;
+
+    private static final int DEEP_GREEN_ALPHA = 210;
+    private static final int DEEP_GREEN_R = 20;
+    private static final int DEEP_GREEN_G = 220;
+    private static final int DEEP_GREEN_B = 20;
+
+    private static final int DEEP_RED_ALPHA = 210;
+    private static final int DEEP_RED_R = 220;
+    private static final int DEEP_RED_G = 20;
+    private static final int DEEP_RED_B = 20;
 
     private record SlotProfitEntry(
             String fingerprint,
@@ -479,32 +503,44 @@ public final class ProfitRenderer {
         double profitFraction = (double) netProfit / (double) estimatedValue;
 
         if (Math.abs(profitFraction) < NEUTRAL_BAND_PERCENT) {
-            return (130 << 24) | (0xE0 << 16) | (0xD0 << 8) | 0x00;
+            return packColor(NEUTRAL_ALPHA, NEUTRAL_R, NEUTRAL_G, NEUTRAL_B);
         }
+
+        // t = 0 right at the neutral edge, t = 1 at MAX_SCALE_PERCENT or
+        // beyond. Interpolating FROM the neutral color (rather than
+        // jumping straight to some other starting shade) means a flip
+        // just barely past the neutral cutoff reads as "barely more than
+        // neutral" instead of a random, possibly duller color that can
+        // look like nothing rendered at all.
+        double t = Math.min(1.0,
+                (Math.abs(profitFraction) - NEUTRAL_BAND_PERCENT)
+                / (MAX_SCALE_PERCENT - NEUTRAL_BAND_PERCENT));
 
         if (profitFraction > 0) {
-            // Good deal: BIN is below estimated value -> green
-            double t = Math.min(1.0,
-                    (profitFraction - NEUTRAL_BAND_PERCENT)
-                    / (MAX_SCALE_PERCENT - NEUTRAL_BAND_PERCENT));
-
-            int r = (int) (210 * (1.0 - t));
-            int g = (int) (170 + 50 * t);
-            int b = 0;
-            int alpha = (int) (140 + 70 * t);
-            return (alpha << 24) | (r << 16) | (g << 8) | b;
+            return lerpColor(
+                    NEUTRAL_ALPHA, NEUTRAL_R, NEUTRAL_G, NEUTRAL_B,
+                    DEEP_GREEN_ALPHA, DEEP_GREEN_R, DEEP_GREEN_G, DEEP_GREEN_B,
+                    t
+            );
         } else {
-            // Bad deal: BIN is above estimated value -> red
-            double t = Math.min(1.0,
-                    (Math.abs(profitFraction) - NEUTRAL_BAND_PERCENT)
-                    / (MAX_SCALE_PERCENT - NEUTRAL_BAND_PERCENT));
-
-            int r = (int) (200 + 40 * t);
-            int g = (int) (170 * (1.0 - t));
-            int b = 0;
-            int alpha = (int) (140 + 70 * t);
-            return (alpha << 24) | (r << 16) | (g << 8) | b;
+            return lerpColor(
+                    NEUTRAL_ALPHA, NEUTRAL_R, NEUTRAL_G, NEUTRAL_B,
+                    DEEP_RED_ALPHA, DEEP_RED_R, DEEP_RED_G, DEEP_RED_B,
+                    t
+            );
         }
+    }
+
+    private static int packColor(int alpha, int r, int g, int b) {
+        return (alpha << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    private static int lerpColor(int a0, int r0, int g0, int b0, int a1, int r1, int g1, int b1, double t) {
+        int a = (int) (a0 + (a1 - a0) * t);
+        int r = (int) (r0 + (r1 - r0) * t);
+        int g = (int) (g0 + (g1 - g0) * t);
+        int b = (int) (b0 + (b1 - b0) * t);
+        return packColor(a, r, g, b);
     }
 
     /**
