@@ -20,16 +20,12 @@ public final class PriceProvider {
     private record Tier(String... labels) {}
 
     // Confirmed against a real in-game COFL tooltip: "Med: ~24,235,554 Vol: 0.8".
-    // The "Med:" line and the "Vol:" that follows it on the same line both
-    // start with distinct labels before their own colon, and PriceParser only
-    // reads up to the first number after the first colon, so the trailing
-    // "Vol: 0.8" segment is never mistaken for the median value.
-    //
-    // Note: COFL also shows its own separate "Estimated Value:" line (a
-    // blended figure combining lbin/median/craft cost), which is NOT what
-    // this tier targets - this tier is specifically the raw median. Because
-    // that blended line's label text is identical to SkyHanni's, the two
-    // can't be told apart by text alone if both mods are installed.
+    // COFL itself only produces the "lbin:" and "Med:" lines on that
+    // tooltip - the "Full Craft Cost:" and "Estimated Value:" lines seen
+    // alongside them come from a separate, unidentified mod, not COFL.
+    // The "Med:"/"Vol:" pair sharing one line is handled correctly because
+    // PriceParser only reads up to the first number after the first colon,
+    // so the trailing "Vol: 0.8" segment is never mistaken for the median.
     private static final Tier COFL = new Tier("med:");
 
     private static final Tier SKYBLOCKER = new Tier("est. item value:");
@@ -41,9 +37,8 @@ public final class PriceProvider {
             "est. item value:"
     );
 
-    // "Full Craft Cost:" confirmed from the same real COFL tooltip; "Crafting
-    // Price:" confirmed from SkyBlocker's CraftPriceTooltip.java.
-    private static final Tier CRAFT_PRICE = new Tier("crafting price:", "craft price:", "full craft cost:");
+    // "Crafting Price:" confirmed from SkyBlocker's CraftPriceTooltip.java.
+    private static final Tier CRAFT_PRICE = new Tier("crafting price:", "craft price:");
 
     private static final Tier[] PRIORITY = { COFL, SKYBLOCKER, SKYHANNI, CRAFT_PRICE };
 
