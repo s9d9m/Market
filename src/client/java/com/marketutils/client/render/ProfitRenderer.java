@@ -86,6 +86,15 @@ public final class ProfitRenderer {
     private static volatile long scanCompletedNanos = 0L;
     private static volatile boolean scanComplete = false;
 
+    // Measurement only (DEBUG mode's scan stats) - not used for any logic
+    // decision. totalTooltipParses counts getTooltipLines() calls, i.e. the
+    // one genuinely expensive operation per item; cacheHits/Misses count how
+    // often renderSlotBackground's fast path was taken vs. fell through to
+    // an actual evaluation, this scan cycle.
+    private static volatile int totalTooltipParses = 0;
+    private static volatile int cacheHitsThisScan = 0;
+    private static volatile int cacheMissesThisScan = 0;
+
     private static final int BORDER_THICKNESS = 2;
 
     private static final double NEUTRAL_BAND_PERCENT = 0.03;
@@ -116,7 +125,6 @@ public final class ProfitRenderer {
     private static final int DEEP_RED_B = 20;
 
     private record SlotProfitEntry(
-            String fingerprint,
             long price,
             long estimatedValue,
             int tintColor,
@@ -148,26 +156,20 @@ public final class ProfitRenderer {
             return;
         }
 
-        if (evaluating) {
-            return;
-        }
-
-        resetFrameCounterIfNewFrame();
-
         int slotIndex = slot.index;
-        String fingerprint = buildFingerprint(stack);
         SlotProfitEntry cached = SLOT_CACHE.get(slotIndex);
 
-        if (cached != null && !cached.fingerprint().equals(fingerprint)) {
-            // This slot's item changed without the screen being rebuilt
-            // (e.g. an in-place AH page swap that reuses the same screen
-            // instance) - the whole page just changed, not just this slot,
-            // so restart the full scan rather than patch one entry.
-            clearCache();
-            cached = null;
-            OBSERVED_SLOTS.add(slotIndex);
-        }
-
+        // Fast path: a stable cached result is trusted with no rebuild work
+        // at all - not even a display-name read. Page-level invalidation is
+        // handled entirely by onContainerRevisionSeen (Minecraft's own
+        // server-authoritative sync revision - see AbstractContainerMenuMixin)
+        // and trackScreen (screen-instance identity), both of which clear
+        // the whole cache the moment either signal fires, independently of
+        // this per-slot per-frame path. A per-frame fingerprint rebuild+
+        // compare here would just be re-detecting the same page change
+        // those two mechanisms already caught, for every one of 54 slots,
+        // every single frame.
+        //
         // Only trust a cached result if price data was actually found - NOT
         // just tintColor != 0, since a fully-resolved item can legitimately
         // have tintColor == 0 now (filtered out by the profitable-only or
@@ -176,9 +178,16 @@ public final class ProfitRenderer {
         // that genuinely found nothing yet (e.g. COFL's median not loaded
         // yet) still keeps retrying on later frames.
         if (cached != null && cached.price() > 0L && cached.estimatedValue() > 0L) {
+            cacheHitsThisScan++;
             renderBorder(guiGraphics, slot, cached.tintColor());
             return;
         }
+
+        if (evaluating) {
+            return;
+        }
+
+        resetFrameCounterIfNewFrame();
 
         // A slot's first-ever evaluation this scan cycle gets a much higher
         // per-frame budget than retries, so a freshly opened/changed page
@@ -198,9 +207,10 @@ public final class ProfitRenderer {
             return;
         }
 
+        cacheMissesThisScan++;
         evaluating = true;
         try {
-            SlotProfitEntry entry = evaluateFromTooltip(stack, fingerprint);
+            SlotProfitEntry entry = evaluateFromTooltip(stack);
             SLOT_CACHE.put(slotIndex, entry);
             if (isFirstAttempt) {
                 firstPassEvaluationsThisFrame++;
@@ -322,6 +332,9 @@ public final class ProfitRenderer {
         } else {
             lines.add(Component.literal("\u00A77Scan time: \u00A7escanning..."));
         }
+
+        lines.add(Component.literal("\u00A77Tooltip parses: \u00A7f" + totalTooltipParses));
+        lines.add(Component.literal("\u00A77Cache hits/misses: \u00A7f" + cacheHitsThisScan + "/" + cacheMissesThisScan));
     }
 
     /**
@@ -377,18 +390,30 @@ public final class ProfitRenderer {
         scanStartNanos = System.nanoTime();
         scanCompletedNanos = 0L;
         scanComplete = false;
+        totalTooltipParses = 0;
+        cacheHitsThisScan = 0;
+        cacheMissesThisScan = 0;
     }
 
     // -- Internal evaluation --
 
-    private static SlotProfitEntry evaluateFromTooltip(ItemStack stack, String fingerprint) {
+    private static SlotProfitEntry evaluateFromTooltip(ItemStack stack) {
         List<Component> tooltipLines = fetchFullTooltipLines(stack);
+        totalTooltipParses++;
         if (tooltipLines.isEmpty()) {
-            return new SlotProfitEntry(fingerprint, 0L, 0L, 0, Map.of(), null);
+            return new SlotProfitEntry(0L, 0L, 0, Map.of(), null);
         }
 
         long price = 0L;
+        Map<PriceSource, Long> sourceValues = PriceProvider.newValueMap();
 
+        // Single pass over the tooltip: formatting/lowercasing/colon-lookup
+        // happens exactly once per line, and that one line is checked for
+        // BOTH the listing price and every known PriceSource's label in the
+        // same iteration - previously this was up to ~11 separate full
+        // scans of the same small list per item (one for price, one per
+        // source in findAllValues, one per source walking AUTO_PRIORITY
+        // twice more for findAutoSource/resolveValue).
         for (Component line : tooltipLines) {
             String plain = PriceParser.stripFormatting(line.getString());
             String lower = plain.toLowerCase();
@@ -396,32 +421,34 @@ public final class ProfitRenderer {
             if (colon == -1) {
                 continue;
             }
+            String afterColon = plain.substring(colon + 1);
 
             if (price == 0L && isListingPriceLabel(lower)) {
-                long parsed = PriceParser.parsePrice(plain.substring(colon + 1));
+                long parsed = PriceParser.parsePrice(afterColon);
                 if (parsed > 0L) {
                     price = parsed;
                 }
             }
+
+            PriceProvider.accumulateSourceValues(lower, afterColon, sourceValues);
         }
 
         // Computed unconditionally (not just in DEBUG mode) since it's cheap
         // and this is the one place it's safe to call getTooltipLines() -
         // appendTooltipText must never re-fetch the tooltip itself, since
         // it runs from inside the callback that's already building it.
-        Map<PriceSource, Long> sourceValues = PriceProvider.findAllValues(tooltipLines);
-        PriceSource autoSelectedSource = PriceProvider.findAutoSource(tooltipLines);
+        PriceSource autoSelectedSource = PriceProvider.findAutoSource(sourceValues);
 
         // Estimated value comes from whichever source the current
         // PricingMode selects. See PriceProvider/PricingMode.
-        long estimatedValue = PriceProvider.resolveValue(tooltipLines, MarketUtilsConfig.getMode());
+        long estimatedValue = PriceProvider.resolveValue(sourceValues, MarketUtilsConfig.getMode());
 
         if (price <= 0L || estimatedValue <= 0L) {
-            return new SlotProfitEntry(fingerprint, price, estimatedValue, 0, sourceValues, autoSelectedSource);
+            return new SlotProfitEntry(price, estimatedValue, 0, sourceValues, autoSelectedSource);
         }
 
         int color = computeTintColor(price, estimatedValue);
-        return new SlotProfitEntry(fingerprint, price, estimatedValue, color, sourceValues, autoSelectedSource);
+        return new SlotProfitEntry(price, estimatedValue, color, sourceValues, autoSelectedSource);
     }
 
     /**
@@ -590,12 +617,6 @@ public final class ProfitRenderer {
             firstPassEvaluationsThisFrame = 0;
             lastFrameStartNanos = now;
         }
-    }
-
-    // -- Fingerprinting --
-
-    private static String buildFingerprint(ItemStack stack) {
-        return stack.getDisplayName().getString();
     }
 
     // -- Number formatting --

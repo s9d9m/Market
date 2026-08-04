@@ -1,17 +1,19 @@
 package com.marketutils.client.util;
 
-import net.minecraft.network.chat.Component;
-
 import java.util.EnumMap;
-import java.util.List;
 import java.util.Map;
 
 /**
  * Resolves an item's estimated value from whichever compatible mod's
- * tooltip line is present. Each PriceSource is scanned across the full
- * tooltip independently of the others, so a lower-priority source's line
- * is never mistaken for a higher-priority one just because it happens to
- * appear first in the list.
+ * tooltip line is present. All sources are matched in a single pass over
+ * the tooltip (see accumulateSourceValues) so a lower-priority source's
+ * line is never mistaken for a higher-priority one just because it happens
+ * to appear first, without re-scanning the tooltip once per source.
+ *
+ * Everything below operates on an already-scanned Map<PriceSource, Long>
+ * rather than the raw tooltip lines - callers scan the tooltip exactly
+ * once (via accumulateSourceValues, one call per line) and then derive
+ * AUTO selection / mode resolution from that map for free.
  *
  * AUTO priority order: COFL median -> SkyHanni value -> craft price.
  * SkyBlocker and any future source are deliberately left out of this list
@@ -29,46 +31,43 @@ public final class PriceProvider {
     private PriceProvider() {}
 
     /**
-     * Scans the tooltip for a single source's label and returns its value,
-     * or 0 if that source has no matching line.
+     * Checks one already-lowercased, colon-confirmed tooltip line against
+     * every price source's labels, filling in "values" for any source that
+     * matches and hasn't already been found on an earlier line in this same
+     * scan (first-match-per-source-wins, so a later line can never overwrite
+     * an earlier one). Call this once per tooltip line to scan for every
+     * known source in exactly one pass over the tooltip.
+     *
+     * @param lowerLine  the line's text, formatting-stripped and lowercased
+     * @param afterColon the raw (non-lowercased) text after the line's colon,
+     *                   ready for PriceParser.parsePrice
      */
-    public static long findValue(List<Component> lines, PriceSource source) {
-        for (Component line : lines) {
-            String plain = PriceParser.stripFormatting(line.getString());
-            String lower = plain.toLowerCase();
-            int colon = plain.indexOf(':');
-            if (colon == -1) {
+    public static void accumulateSourceValues(String lowerLine, String afterColon, Map<PriceSource, Long> values) {
+        for (PriceSource source : PriceSource.values()) {
+            if (values.containsKey(source)) {
                 continue;
             }
-
             for (String label : source.labels()) {
-                if (lower.contains(label)) {
-                    long parsed = PriceParser.parsePrice(plain.substring(colon + 1));
+                if (lowerLine.contains(label)) {
+                    long parsed = PriceParser.parsePrice(afterColon);
                     if (parsed > 0L) {
-                        return parsed;
+                        values.put(source, parsed);
                     }
+                    break;
                 }
             }
         }
-        return 0L;
     }
 
-    /**
-     * Scans the tooltip for every known source at once, for DEBUG mode's
-     * side-by-side comparison.
-     */
-    public static Map<PriceSource, Long> findAllValues(List<Component> lines) {
-        Map<PriceSource, Long> values = new EnumMap<>(PriceSource.class);
-        for (PriceSource source : PriceSource.values()) {
-            values.put(source, findValue(lines, source));
-        }
-        return values;
+    /** Fresh, empty map to accumulate into via accumulateSourceValues. */
+    public static Map<PriceSource, Long> newValueMap() {
+        return new EnumMap<>(PriceSource.class);
     }
 
-    /** Walks AUTO_PRIORITY and returns the first source with a value. */
-    public static long findAutoValue(List<Component> lines) {
+    /** Walks AUTO_PRIORITY against an already-scanned value map. */
+    public static long findAutoValue(Map<PriceSource, Long> values) {
         for (PriceSource source : AUTO_PRIORITY) {
-            long value = findValue(lines, source);
+            long value = values.getOrDefault(source, 0L);
             if (value > 0L) {
                 return value;
             }
@@ -76,10 +75,10 @@ public final class PriceProvider {
         return 0L;
     }
 
-    /** Returns the source AUTO would pick, or null if none has a value. */
-    public static PriceSource findAutoSource(List<Component> lines) {
+    /** Returns the source AUTO would pick from an already-scanned value map, or null if none has a value. */
+    public static PriceSource findAutoSource(Map<PriceSource, Long> values) {
         for (PriceSource source : AUTO_PRIORITY) {
-            if (findValue(lines, source) > 0L) {
+            if (values.getOrDefault(source, 0L) > 0L) {
                 return source;
             }
         }
@@ -87,19 +86,20 @@ public final class PriceProvider {
     }
 
     /**
-     * Resolves the estimated value according to the given mode. Forced
-     * single-source modes (COFL_MEDIAN, SKYHANNI, CRAFT_PRICE) return only
-     * that source's value - if it has none, this returns 0 rather than
-     * falling back to another source. DEBUG uses the same value AUTO would
-     * pick, since it's meant to show what was selected alongside the raw
-     * breakdown, not to change the actual grading.
+     * Resolves the estimated value according to the given mode from an
+     * already-scanned value map. Forced single-source modes (COFL_MEDIAN,
+     * SKYHANNI, CRAFT_PRICE) return only that source's value - if it has
+     * none, this returns 0 rather than falling back to another source.
+     * DEBUG uses the same value AUTO would pick, since it's meant to show
+     * what was selected alongside the raw breakdown, not to change the
+     * actual grading.
      */
-    public static long resolveValue(List<Component> lines, PricingMode mode) {
+    public static long resolveValue(Map<PriceSource, Long> values, PricingMode mode) {
         return switch (mode) {
-            case AUTO, DEBUG -> findAutoValue(lines);
-            case COFL_MEDIAN -> findValue(lines, PriceSource.COFL_MEDIAN);
-            case SKYHANNI -> findValue(lines, PriceSource.SKYHANNI);
-            case CRAFT_PRICE -> findValue(lines, PriceSource.CRAFT_PRICE);
+            case AUTO, DEBUG -> findAutoValue(values);
+            case COFL_MEDIAN -> values.getOrDefault(PriceSource.COFL_MEDIAN, 0L);
+            case SKYHANNI -> values.getOrDefault(PriceSource.SKYHANNI, 0L);
+            case CRAFT_PRICE -> values.getOrDefault(PriceSource.CRAFT_PRICE, 0L);
         };
     }
 }
