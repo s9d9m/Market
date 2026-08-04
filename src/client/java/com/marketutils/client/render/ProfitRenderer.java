@@ -1,13 +1,13 @@
 package com.marketutils.client.render;
 
 import com.marketutils.client.util.PriceParser;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.GuiGraphics;
-import net.minecraft.world.inventory.Slot;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.TooltipFlag;
-import net.minecraft.world.item.Item;
-import net.minecraft.network.chat.Component;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.item.TooltipContext;
+import net.minecraft.item.tooltip.TooltipType;
+import net.minecraft.screen.slot.Slot;
+import net.minecraft.item.ItemStack;
+import net.minecraft.text.Text;
 
 import java.util.HashMap;
 import java.util.List;
@@ -56,7 +56,7 @@ public final class ProfitRenderer {
      * everything at the slot edges, leaving the center visible for rarity
      * backgrounds from SkyHanni and the item icon.
      */
-    public static void renderSlotBackground(GuiGraphics guiGraphics, Slot slot) {
+    public static void renderSlotBackground(DrawContext guiGraphics, Slot slot) {
         if (slot == null) {
             return;
         }
@@ -109,7 +109,7 @@ public final class ProfitRenderer {
      * item, the tooltip text is derived from the cache. If not (e.g., the
      * item hasn't been rendered yet), we try parsing the provided lines.
      */
-    public static void appendTooltipText(ItemStack stack, List<Component> lines) {
+    public static void appendTooltipText(ItemStack stack, List<Text> lines) {
         if (stack == null || stack.isEmpty() || lines == null) {
             return;
         }
@@ -132,7 +132,7 @@ public final class ProfitRenderer {
         } else {
             // Fallback: try parsing the provided tooltip lines directly.
             // This works if SkyHanni's callback fired before ours.
-            for (Component line : lines) {
+            for (Text line : lines) {
                 String plain = PriceParser.stripFormatting(line.getString());
                 String lower = plain.toLowerCase();
                 int colon = plain.indexOf(':');
@@ -177,7 +177,7 @@ public final class ProfitRenderer {
                         NEUTRAL_BAND_PERCENT * 100.0
                 );
             }
-            lines.add(Component.literal(text));
+            lines.add(Text.literal(text));
 
         }
     }
@@ -206,21 +206,21 @@ public final class ProfitRenderer {
     // -- Internal evaluation --
 
     private static SlotProfitEntry evaluateFromTooltip(ItemStack stack, String fingerprint) {
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.level == null || mc.player == null) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.world == null || mc.player == null) {
             return new SlotProfitEntry(fingerprint, 0L, 0L, 0);
         }
 
-        List<Component> tooltipLines = stack.getTooltipLines(
-                Item.TooltipContext.of(mc.level),
+        List<Text> tooltipLines = stack.getTooltip(
+                TooltipContext.create(mc.world),
                 mc.player,
-                TooltipFlag.Default.NORMAL
+                TooltipType.BASIC
         );
 
         long price = 0L;
         long estimatedValue = 0L;
 
-        for (Component line : tooltipLines) {
+        for (Text line : tooltipLines) {
             String plain = PriceParser.stripFormatting(line.getString());
             String lower = plain.toLowerCase();
             int colon = plain.indexOf(':');
@@ -300,7 +300,7 @@ public final class ProfitRenderer {
      * are drawn; the center area is untouched so SkyHanni's rarity
      * background and the item icon remain fully visible.
      */
-    private static void renderBorder(GuiGraphics g, Slot slot, int color) {
+    private static void renderBorder(DrawContext g, Slot slot, int color) {
         if (color == 0) {
             return;
         }
