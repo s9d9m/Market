@@ -14,8 +14,10 @@ import net.minecraft.world.item.Item;
 import net.minecraft.network.chat.Component;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Evaluates whether auction items are worth buying by comparing listing price
@@ -23,6 +25,15 @@ import java.util.Map;
  * PricingMode is currently selected in MarketUtilsConfig (see
  * "/marketutils mode"). Renders a colored BORDER around slots (so SkyHanni's
  * rarity backgrounds remain visible) and appends debug text to tooltips.
+ *
+ * Caching strategy: every visible slot gets evaluated and cached by slot
+ * index as soon as the AH screen renders it (throttled to
+ * MAX_EVALUATIONS_PER_FRAME per frame, so a full 54-slot page settles in a
+ * fraction of a second rather than costing a frame drop). Hovering an item
+ * only ever reads that cache - it never re-evaluates or re-parses tooltip
+ * text on its own. The currently-hovered slot is tracked directly from
+ * Minecraft's own hoveredSlot field (via the mixin), not by matching item
+ * display names, so results can never be shown for the wrong slot.
  *
  * Color scale is percentage-based:
  *   BIN far below estimated value  -> deep green border  (great deal)
@@ -41,6 +52,17 @@ public final class ProfitRenderer {
 
     private static final Map<Integer, SlotProfitEntry> SLOT_CACHE = new HashMap<>();
 
+    /** Every slot index the current screen has rendered at least once, whether it had an item or not - used for scan-progress reporting. */
+    private static final Set<Integer> OBSERVED_SLOTS = new HashSet<>();
+    private static final int TOTAL_AH_SLOTS = 54;
+
+    private static volatile int hoveredSlotIndex = -1;
+    private static Object currentScreenIdentity;
+
+    private static volatile long scanStartNanos = System.nanoTime();
+    private static volatile long scanCompletedNanos = 0L;
+    private static volatile boolean scanComplete = false;
+
     private static final int BORDER_THICKNESS = 2;
 
     private static final double NEUTRAL_BAND_PERCENT = 0.03;
@@ -58,15 +80,21 @@ public final class ProfitRenderer {
     private ProfitRenderer() {}
 
     /**
-     * Called from the renderSlot mixin (at TAIL, after item icon and rarity
-     * backgrounds have been drawn). Draws a 2px colored border on top of
-     * everything at the slot edges, leaving the center visible for rarity
-     * backgrounds from SkyHanni and the item icon.
+     * Called from the render mixin for every visible slot, every frame,
+     * regardless of hover. This is what drives the eager full-page scan:
+     * each new (or invalidated) slot gets evaluated once, throttled to
+     * MAX_EVALUATIONS_PER_FRAME globally, and cached by slot index.
+     * Draws a 2px colored border on top of everything at the slot edges,
+     * leaving the center visible for rarity backgrounds from SkyHanni and
+     * the item icon.
      */
     public static void renderSlotBackground(GuiGraphicsExtractor guiGraphics, Slot slot) {
         if (slot == null) {
             return;
         }
+
+        OBSERVED_SLOTS.add(slot.index);
+        checkScanComplete();
 
         ItemStack stack = slot.getItem();
         if (stack.isEmpty()) {
@@ -83,12 +111,22 @@ public final class ProfitRenderer {
         String fingerprint = buildFingerprint(stack);
         SlotProfitEntry cached = SLOT_CACHE.get(slotIndex);
 
+        if (cached != null && !cached.fingerprint().equals(fingerprint)) {
+            // This slot's item changed without the screen being rebuilt
+            // (e.g. an in-place AH page swap that reuses the same screen
+            // instance) - the whole page just changed, not just this slot,
+            // so restart the full scan rather than patch one entry.
+            clearCache();
+            cached = null;
+            OBSERVED_SLOTS.add(slotIndex);
+        }
+
         // Only trust a cached "no value" result if it actually found one.
         // A source like COFL's median can take a moment to become available
         // after login/screen-open (e.g. an async fetch not finished yet), so
         // a slot that found nothing on its first evaluation must keep being
         // retried on later frames rather than being stuck silent forever.
-        if (cached != null && cached.fingerprint().equals(fingerprint) && cached.tintColor() != 0) {
+        if (cached != null && cached.tintColor() != 0) {
             renderBorder(guiGraphics, slot, cached.tintColor());
             return;
         }
@@ -110,16 +148,13 @@ public final class ProfitRenderer {
 
     /**
      * Called from the ItemTooltipCallback registered in MarketutilsClient.
-     *
-     * This callback parses the tooltip lines that have been assembled SO FAR.
-     * SkyHanni's "Estimated Item Value" line may or may not be present
-     * depending on callback registration order.
-     *
-     * To handle this, the tooltip text falls back to the SLOT_CACHE (which
-     * was populated by renderSlotBackground using a separate getTooltipLines
-     * call that includes all mods' lines). If the cache has data for this
-     * item, the tooltip text is derived from the cache. If not (e.g., the
-     * item hasn't been rendered yet), we try parsing the provided lines.
+     * Purely a cache read keyed by the currently-hovered slot index (tracked
+     * by the mixin from Minecraft's own hoveredSlot field) - it never
+     * evaluates or parses tooltip text itself, and never calls
+     * getTooltipLines() (that would recurse infinitely, since this callback
+     * runs from inside the tooltip build it would be asking for again). If
+     * that slot hasn't been scanned yet, nothing is shown rather than
+     * falling back to a partial/unreliable parse.
      */
     public static void appendTooltipText(ItemStack stack, List<Component> lines) {
         if (stack == null || stack.isEmpty() || lines == null) {
@@ -130,44 +165,11 @@ public final class ProfitRenderer {
             return;
         }
 
+        SlotProfitEntry entry = hoveredSlotIndex >= 0 ? SLOT_CACHE.get(hoveredSlotIndex) : null;
 
-        long price = 0L;
-        long estimatedValue = 0L;
-
-        // First: check the slot cache for pre-computed data from renderSlotBackground.
-        // The slot cache was populated via getTooltipLines() which fires ALL mod
-        // callbacks (including SkyHanni), so it reliably has the estimated value.
-        SlotProfitEntry cachedEntry = findCachedEntryForStack(stack);
-        if (cachedEntry != null && cachedEntry.price() > 0L && cachedEntry.estimatedValue() > 0L) {
-            price = cachedEntry.price();
-            estimatedValue = cachedEntry.estimatedValue();
-        } else {
-            // Fallback: try parsing the provided tooltip lines directly.
-            // This works if SkyHanni's callback fired before ours.
-            for (Component line : lines) {
-                String plain = PriceParser.stripFormatting(line.getString());
-                String lower = plain.toLowerCase();
-                int colon = plain.indexOf(':');
-                if (colon == -1) {
-                    continue;
-                }
-
-                if (price == 0L && isListingPriceLabel(lower)) {
-                    long parsed = PriceParser.parsePrice(plain.substring(colon + 1));
-                    if (parsed > 0L) {
-                        price = parsed;
-                    }
-                }
-            }
-
-            // Estimated value comes from whichever source the current
-            // PricingMode selects. See PriceProvider/PricingMode.
-            estimatedValue = PriceProvider.resolveValue(lines, MarketUtilsConfig.getMode());
-        }
-
-        if (price > 0L && estimatedValue > 0L) {
-            long delta = estimatedValue - price;
-            double profitPercent = (double) delta / (double) estimatedValue * 100.0;
+        if (entry != null && entry.price() > 0L && entry.estimatedValue() > 0L) {
+            long delta = entry.estimatedValue() - entry.price();
+            double profitPercent = (double) delta / (double) entry.estimatedValue() * 100.0;
 
             String text;
             if (profitPercent > NEUTRAL_BAND_PERCENT * 100.0) {
@@ -187,22 +189,12 @@ public final class ProfitRenderer {
                 );
             }
             lines.add(Component.literal(text));
-
         }
 
         if (MarketUtilsConfig.getMode() == PricingMode.DEBUG) {
-            // Never call getTooltipLines() here - appendTooltipText runs
-            // from inside the callback that IS the tooltip being built, so
-            // asking for the tooltip again recurses infinitely and crashes.
-            // Use the cache (populated separately, safely, by
-            // evaluateFromTooltip via the render mixin) if it's ready yet;
-            // otherwise fall back to scanning the already-provided `lines`
-            // directly, which is safe since it's not a new fetch.
-            SlotProfitEntry cachedForDebug = findCachedEntryForStack(stack);
-            if (cachedForDebug != null) {
-                appendDebugBreakdown(lines, price, cachedForDebug.sourceValues(), cachedForDebug.autoSelectedSource());
-            } else {
-                appendDebugBreakdown(lines, price, PriceProvider.findAllValues(lines), PriceProvider.findAutoSource(lines));
+            appendScanStats(lines);
+            if (entry != null) {
+                appendDebugBreakdown(lines, entry.price(), entry.sourceValues(), entry.autoSelectedSource());
             }
         }
     }
@@ -241,42 +233,56 @@ public final class ProfitRenderer {
         }
     }
 
-    public static void clearCache() {
-        SLOT_CACHE.clear();
+    /** DEBUG mode: overall scan progress, independent of whether this specific item has been evaluated yet. */
+    private static void appendScanStats(List<Component> lines) {
+        int scanned = OBSERVED_SLOTS.size();
+        long priced = SLOT_CACHE.values().stream().filter(e -> e.tintColor() != 0).count();
+
+        lines.add(Component.literal("\u00A76--- MarketUtils Scan ---"));
+        lines.add(Component.literal("\u00A77Slots scanned: \u00A7f" + scanned + "/" + TOTAL_AH_SLOTS));
+        lines.add(Component.literal("\u00A77Prices cached: \u00A7f" + priced + "/" + TOTAL_AH_SLOTS));
+
+        if (scanComplete) {
+            long scanMillis = (scanCompletedNanos - scanStartNanos) / 1_000_000L;
+            long ageMillis = (System.nanoTime() - scanCompletedNanos) / 1_000_000L;
+            lines.add(Component.literal("\u00A77Scan time: \u00A7f" + scanMillis + "ms"));
+            lines.add(Component.literal("\u00A77Cache age: \u00A7f" + formatAge(ageMillis)));
+        } else {
+            lines.add(Component.literal("\u00A77Scan time: \u00A7escanning..."));
+        }
     }
 
-    // -- Cache lookup for tooltip fallback --
-
     /**
-     * Scans the slot cache for an entry whose fingerprint matches this
-     * stack's display name. Used by appendTooltipText to retrieve the
-     * pre-computed price/value from the render path.
+     * Called every frame from the render mixin with the screen instance.
+     * A different instance than last time (reopening the AH, or any other
+     * screen rebuild) means everything cached is for a different page.
      */
-    private static SlotProfitEntry findCachedEntryForStack(ItemStack stack) {
-        String targetFingerprint = buildFingerprint(stack);
-        SlotProfitEntry match = null;
-
-        for (SlotProfitEntry entry : SLOT_CACHE.values()) {
-            if (!entry.fingerprint().equals(targetFingerprint)) {
-                continue;
-            }
-
-            if (match != null) {
-                // Multiple slots share this display name (a common AH page
-                // full of similar listings). There is no way to tell which
-                // one's cached data belongs to the item actually being
-                // hovered - appendTooltipText only receives an ItemStack,
-                // not a slot index - so showing either would risk
-                // presenting a DIFFERENT item's numbers as this one's.
-                // Bail out and let the caller fall back to scanning this
-                // item's own tooltip lines instead.
-                return null;
-            }
-
-            match = entry;
+    public static void trackScreen(Object screenInstance) {
+        if (currentScreenIdentity != screenInstance) {
+            currentScreenIdentity = screenInstance;
+            clearCache();
         }
+    }
 
-        return match;
+    /** Called from the render mixin when inventorySlot == hoveredSlot. */
+    public static void setHoveredSlotIndex(int index) {
+        hoveredSlotIndex = index;
+    }
+
+    private static void checkScanComplete() {
+        if (!scanComplete && OBSERVED_SLOTS.size() >= TOTAL_AH_SLOTS) {
+            scanComplete = true;
+            scanCompletedNanos = System.nanoTime();
+        }
+    }
+
+    public static void clearCache() {
+        SLOT_CACHE.clear();
+        OBSERVED_SLOTS.clear();
+        hoveredSlotIndex = -1;
+        scanStartNanos = System.nanoTime();
+        scanCompletedNanos = 0L;
+        scanComplete = false;
     }
 
     // -- Internal evaluation --
@@ -488,5 +494,12 @@ public final class ProfitRenderer {
             return String.format("%.1fK", number / 1_000.0);
         }
         return String.valueOf(number);
+    }
+
+    private static String formatAge(long millis) {
+        if (millis < 1000L) {
+            return millis + "ms";
+        }
+        return String.format("%.1fs", millis / 1000.0);
     }
 }
