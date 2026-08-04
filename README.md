@@ -1,6 +1,6 @@
 # MarketUtils
 
-A Fabric 1.21.10 client-side mod for Hypixel Skyblock that evaluates Auction House listings at a glance.
+A Fabric 26.1.2 client-side mod for Hypixel Skyblock that evaluates Auction House listings at a glance.
 
 ## What it does
 
@@ -20,10 +20,10 @@ A tooltip line is appended when hovering, showing the percentage and coin differ
 
 ## Requirements
 
-- Fabric Loader >= 0.19.2
-- Fabric API 0.138.4+1.21.10
-- Minecraft 1.21.10
-- Java 21
+- Fabric Loader >= 0.18.4
+- Fabric API 0.155.2+26.1.2
+- Minecraft 26.1.2
+- Java 25
 - SkyHanni (provides the "Estimated Item Value" tooltip line this mod reads)
 
 ## Build
