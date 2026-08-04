@@ -1,6 +1,7 @@
 package com.marketutils.client.render;
 
 import com.marketutils.client.util.MarketUtilsConfig;
+import com.marketutils.client.util.NetProfitCalculator;
 import com.marketutils.client.util.PriceParser;
 import com.marketutils.client.util.PriceProvider;
 import com.marketutils.client.util.PriceSource;
@@ -128,12 +129,14 @@ public final class ProfitRenderer {
             OBSERVED_SLOTS.add(slotIndex);
         }
 
-        // Only trust a cached "no value" result if it actually found one.
-        // A source like COFL's median can take a moment to become available
-        // after login/screen-open (e.g. an async fetch not finished yet), so
-        // a slot that found nothing on its first evaluation must keep being
-        // retried on later frames rather than being stuck silent forever.
-        if (cached != null && cached.tintColor() != 0) {
+        // Only trust a cached result if price data was actually found - NOT
+        // just tintColor != 0, since a fully-resolved item can legitimately
+        // have tintColor == 0 now (filtered out by the profitable-only or
+        // minimum-profit settings). Checking price/estimatedValue directly
+        // keeps that case correctly treated as stable/cached, while a slot
+        // that genuinely found nothing yet (e.g. COFL's median not loaded
+        // yet) still keeps retrying on later frames.
+        if (cached != null && cached.price() > 0L && cached.estimatedValue() > 0L) {
             renderBorder(guiGraphics, slot, cached.tintColor());
             return;
         }
@@ -185,19 +188,19 @@ public final class ProfitRenderer {
         SlotProfitEntry entry = hoveredSlotIndex >= 0 ? SLOT_CACHE.get(hoveredSlotIndex) : null;
 
         if (entry != null && entry.price() > 0L && entry.estimatedValue() > 0L) {
-            long delta = entry.estimatedValue() - entry.price();
-            double profitPercent = (double) delta / (double) entry.estimatedValue() * 100.0;
+            long netProfit = NetProfitCalculator.netProfit(entry.price(), entry.estimatedValue());
+            double profitPercent = (double) netProfit / (double) entry.estimatedValue() * 100.0;
 
             String text;
             if (profitPercent > NEUTRAL_BAND_PERCENT * 100.0) {
                 text = String.format(
                         "\u00A7aWorth it! %.1f%% below value (%s coins profit)",
-                        profitPercent, formatNumber(delta)
+                        profitPercent, formatNumber(netProfit)
                 );
             } else if (profitPercent < -(NEUTRAL_BAND_PERCENT * 100.0)) {
                 text = String.format(
                         "\u00A7cNot worth it! %.1f%% above value (%s coins loss)",
-                        Math.abs(profitPercent), formatNumber(delta)
+                        Math.abs(profitPercent), formatNumber(netProfit)
                 );
             } else {
                 text = String.format(
@@ -245,15 +248,20 @@ public final class ProfitRenderer {
 
         long selectedValue = values.get(selected);
         if (price > 0L && selectedValue > 0L) {
-            long delta = selectedValue - price;
-            lines.add(Component.literal("\u00A77Estimated Profit: \u00A7f" + formatNumber(delta)));
+            long netProfit = NetProfitCalculator.netProfit(price, selectedValue);
+            lines.add(Component.literal("\u00A77Estimated Profit (net): \u00A7f" + formatNumber(netProfit)));
+            lines.add(Component.literal("\u00A77Would highlight: \u00A7f" + (shouldHighlight(netProfit) ? "Yes" : "No")));
         }
     }
 
     /** DEBUG mode: overall scan progress, independent of whether this specific item has been evaluated yet. */
     private static void appendScanStats(List<Component> lines) {
         int scanned = OBSERVED_SLOTS.size();
-        long priced = SLOT_CACHE.values().stream().filter(e -> e.tintColor() != 0).count();
+        // price/estimatedValue > 0 means data was actually found, regardless
+        // of whether tintColor ended up 0 because it was filtered out.
+        long priced = SLOT_CACHE.values().stream()
+                .filter(e -> e.price() > 0L && e.estimatedValue() > 0L)
+                .count();
 
         lines.add(Component.literal("\u00A76--- MarketUtils Scan ---"));
         lines.add(Component.literal("\u00A77Slots scanned: \u00A7f" + scanned + "/" + TOTAL_AH_SLOTS));
@@ -444,20 +452,31 @@ public final class ProfitRenderer {
     // -- Percentage-based color gradient --
 
     /**
-     * Computes an ARGB color based on how far the listing price is from the
-     * estimated value, expressed as a percentage of estimated value.
+     * Computes an ARGB color based on net profit (after the AH sell tax,
+     * via NetProfitCalculator - never the raw price difference) expressed
+     * as a percentage of estimated value.
      *
-     * profitFraction = (estimatedValue - price) / estimatedValue
-     *   positive => BIN is below estimated (good deal, green)
-     *   negative => BIN is above estimated (bad deal, red)
+     * profitFraction = netProfit / estimatedValue
+     *   positive => net profit after fees (good deal, green)
+     *   negative => net loss after fees (bad deal, red)
      *   near zero => neutral (yellow)
+     *
+     * Returns 0 (no border) if there's no valid price data, or if the
+     * profitable-only / minimum-profit-threshold settings filter this item
+     * out - see shouldHighlight.
      */
     private static int computeTintColor(long price, long estimatedValue) {
         if (estimatedValue <= 0L || price <= 0L) {
             return 0;
         }
 
-        double profitFraction = (double) (estimatedValue - price) / (double) estimatedValue;
+        long netProfit = NetProfitCalculator.netProfit(price, estimatedValue);
+
+        if (!shouldHighlight(netProfit)) {
+            return 0;
+        }
+
+        double profitFraction = (double) netProfit / (double) estimatedValue;
 
         if (Math.abs(profitFraction) < NEUTRAL_BAND_PERCENT) {
             return (130 << 24) | (0xE0 << 16) | (0xD0 << 8) | 0x00;
@@ -486,6 +505,21 @@ public final class ProfitRenderer {
             int alpha = (int) (140 + 70 * t);
             return (alpha << 24) | (r << 16) | (g << 8) | b;
         }
+    }
+
+    /**
+     * Whether an item with this net profit should get a border, per the
+     * profitable-only and minimum-profit-threshold settings. Both apply
+     * together - either one can suppress the border, matching how the
+     * request described them as working together. Neither setting affects
+     * the tooltip's worth-it text or DEBUG output, only border rendering.
+     */
+    private static boolean shouldHighlight(long netProfit) {
+        if (MarketUtilsConfig.isProfitableOnly() && netProfit <= 0L) {
+            return false;
+        }
+
+        return netProfit >= MarketUtilsConfig.getMinimumProfitThreshold();
     }
 
     // -- Frame throttling --
