@@ -38,7 +38,11 @@ fabricApi {
 dependencies {
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
-	mappings loom.officialMojangMappings()
+	// 26.1.2 ships a non-obfuscated client jar, so there is nothing for
+	// named mappings to map - declaring loom.officialMojangMappings() (or
+	// any mappings dependency) fails with "Cannot use Mojang mappings in a
+	// non-obfuscated environment". Fabric API's own 0.155.2+26.1.2 build
+	// declares no mappings dependency either; omit it here to match.
 	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
