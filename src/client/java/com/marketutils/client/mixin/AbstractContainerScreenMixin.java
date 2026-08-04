@@ -10,6 +10,7 @@ import net.minecraft.world.entity.player.Inventory;
 import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -20,6 +21,14 @@ public abstract class AbstractContainerScreenMixin {
     @Shadow
     @Nullable
     protected Slot hoveredSlot;
+
+    // A mixin instance IS the screen instance for its whole lifetime, so the
+    // title (and therefore whether this is an AH screen) never changes once
+    // computed - caching it turns 54 getTitle()/getString()/contains() calls
+    // per frame (one per slot, forever, for as long as the screen is open)
+    // into exactly one, on the first slot of the first frame.
+    @Unique
+    private Boolean marketUtilsIsAuctionScreen;
 
     @Inject(method = "init", at = @At("TAIL"))
     private void clearProfitCacheOnScreenOpen(CallbackInfo callbackInfo) {
@@ -71,15 +80,14 @@ public abstract class AbstractContainerScreenMixin {
     }
 
     private boolean isAuctionScreen() {
-        Screen screenInstance = (Screen) (Object) this;
-        Component titleComponent = screenInstance.getTitle();
-        if (titleComponent == null) {
-            return false;
+        if (marketUtilsIsAuctionScreen == null) {
+            Screen screenInstance = (Screen) (Object) this;
+            Component titleComponent = screenInstance.getTitle();
+            String title = titleComponent == null ? "" : titleComponent.getString();
+            marketUtilsIsAuctionScreen = title.contains("Auction")
+                    || title.contains("Auctions")
+                    || title.contains("BIN");
         }
-
-        String title = titleComponent.getString();
-        return title.contains("Auction")
-                || title.contains("Auctions")
-                || title.contains("BIN");
+        return marketUtilsIsAuctionScreen;
     }
 }

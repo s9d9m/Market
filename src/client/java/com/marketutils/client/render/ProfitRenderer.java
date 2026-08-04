@@ -14,11 +14,9 @@ import net.minecraft.world.item.TooltipFlag;
 import net.minecraft.world.item.Item;
 import net.minecraft.network.chat.Component;
 
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Evaluates whether auction items are worth buying by comparing listing price
@@ -28,21 +26,30 @@ import java.util.Set;
  * rarity backgrounds remain visible) and appends debug text to tooltips.
  *
  * Caching strategy: every visible slot gets evaluated and cached by slot
- * index as soon as the AH screen renders it. Each slot's FIRST evaluation
- * this scan cycle gets a much higher per-frame budget
- * (MAX_FIRST_PASS_EVALUATIONS_PER_FRAME) than retries, so a freshly
- * opened/changed page fills in within a few frames instead of trickling in
- * over ~18 - not a single uncapped pass, since getTooltipLines() also runs
- * every other mod's tooltip logic, and one item that's slow to resolve
- * (e.g. COFL falling back to fuzzy matching) would otherwise stall the
- * whole frame instead of just delaying its own small batch. RETRIES of a
- * slot that came back empty (waiting on an async source like COFL) stay at
- * the much lower MAX_EVALUATIONS_PER_FRAME, so items nothing ever prices
- * don't get re-evaluated every frame forever. Hovering an item
- * only ever reads the cache - it never re-evaluates or re-parses tooltip
- * text on its own. The currently-hovered slot is tracked directly from
- * Minecraft's own hoveredSlot field (via the mixin), not by matching item
- * display names, so results can never be shown for the wrong slot.
+ * index (a plain array, not a Map, since a 54-slot AH page is a fixed,
+ * known size) as soon as the AH screen renders it. There is no per-frame
+ * evaluation *count* cap anymore - instead, each frame gets a nanosecond
+ * TIME budget (FRAME_EVAL_BUDGET_NANOS) to spend on evaluations, so on
+ * hardware/modsets where getTooltipLines() is cheap the whole 54-slot page
+ * finishes in a single frame, while on slower ones it naturally spreads
+ * across as many frames as it actually needs - the cap adapts to reality
+ * instead of guessing a fixed item count. Slots already resolved by a given
+ * frame are a near-free array read, so unspent budget effectively "rolls
+ * forward" onto whatever's left as the scan progresses across frames.
+ *
+ * Items that keep coming back with no price (nothing tracks them, or a
+ * source hasn't loaded yet) retry every frame for the first
+ * QUICK_RETRY_WINDOW_NANOS, then back off to one retry every
+ * RETRY_BACKOFF_NANOS - so a permanently-unpriceable item doesn't burn a
+ * getTooltipLines() call 60+ times a second forever for as long as the page
+ * stays open, while a source that loads a little late still eventually gets
+ * picked up.
+ *
+ * Hovering an item only ever reads the cache - it never re-evaluates or
+ * re-parses tooltip text on its own. The currently-hovered slot is tracked
+ * directly from Minecraft's own hoveredSlot field (via the mixin), not by
+ * matching item display names, so results can never be shown for the wrong
+ * slot.
  *
  * Color scale is percentage-based:
  *   BIN far below estimated value  -> deep green border  (great deal)
@@ -53,28 +60,41 @@ import java.util.Set;
  */
 public final class ProfitRenderer {
 
-    private static final int MAX_EVALUATIONS_PER_FRAME = 3;
+    private static final int TOTAL_AH_SLOTS = 54;
 
-    // First-time evaluations get a much higher budget than retries so a
-    // fresh page fills in quickly, but NOT fully uncapped: getTooltipLines()
-    // fires every other mod's tooltip logic too, and an item COFL can't
-    // cleanly match (falls back to its slower fuzzy-match/estimate path)
-    // can take noticeably longer than a normal lookup. Evaluating all 54
-    // slots synchronously in one frame meant one slow item stalled the
-    // whole frame; capping it bounds that to one small batch instead.
-    private static final int MAX_FIRST_PASS_EVALUATIONS_PER_FRAME = 12;
+    // Per-frame evaluation time budget, replacing the old fixed per-frame
+    // evaluation *count* caps (3 retries / 12 first-attempts). 8ms is half
+    // of a 60fps frame (16.67ms), leaving headroom for actual rendering and
+    // every other mod's own per-frame work - but it's a reasoned default,
+    // not a measured one (this sandbox can't run real Minecraft to profile
+    // real hardware). DEBUG mode's scan stats report actual time-to-full-
+    // scan and per-phase timings so this can be tuned against real numbers
+    // instead of guessed a second time.
+    private static final long FRAME_EVAL_BUDGET_NANOS = 8_000_000L;
 
-    private static int evaluationsThisFrame = 0;
-    private static int firstPassEvaluationsThisFrame = 0;
-    private static long lastFrameStartNanos = 0;
+    // A slot's item is retried every single frame for its first second of
+    // being unresolved (catches most async price sources loading shortly
+    // after page open), then backed off to at most once every 2 seconds -
+    // otherwise a genuinely unpriceable item (no source ever tracks it)
+    // would keep costing a full getTooltipLines() call every frame forever,
+    // for as long as the AH page stays open.
+    private static final long QUICK_RETRY_WINDOW_NANOS = 1_000_000_000L;
+    private static final long RETRY_BACKOFF_NANOS = 2_000_000_000L;
+
+    private static long evalNanosThisFrame = 0L;
+    private static long lastFrameTickNanos = 0L;
 
     private static boolean evaluating = false;
 
-    private static final Map<Integer, SlotProfitEntry> SLOT_CACHE = new HashMap<>();
-
-    /** Every slot index the current screen has rendered at least once, whether it had an item or not - used for scan-progress reporting. */
-    private static final Set<Integer> OBSERVED_SLOTS = new HashSet<>();
-    private static final int TOTAL_AH_SLOTS = 54;
+    // Fixed-size arrays instead of HashMap<Integer,_>/HashSet<Integer> -
+    // every visible slot is read from this every single frame regardless of
+    // hover, forever, for as long as an AH screen is open. A 54-slot AH page
+    // is a known fixed size, so a plain array removes Integer boxing and
+    // hashing from that hot path entirely; it's a direct index, not a hash
+    // lookup.
+    private static final SlotProfitEntry[] SLOT_CACHE = new SlotProfitEntry[TOTAL_AH_SLOTS];
+    private static final boolean[] SLOT_OBSERVED = new boolean[TOTAL_AH_SLOTS];
+    private static int observedSlotCount = 0;
 
     private static volatile int hoveredSlotIndex = -1;
     private static Object currentScreenIdentity;
@@ -86,14 +106,20 @@ public final class ProfitRenderer {
     private static volatile long scanCompletedNanos = 0L;
     private static volatile boolean scanComplete = false;
 
-    // Measurement only (DEBUG mode's scan stats) - not used for any logic
-    // decision. totalTooltipParses counts getTooltipLines() calls, i.e. the
-    // one genuinely expensive operation per item; cacheHits/Misses count how
-    // often renderSlotBackground's fast path was taken vs. fell through to
-    // an actual evaluation, this scan cycle.
+    // Measurement only (DEBUG mode's scan stats) - none of this feeds back
+    // into any logic decision. Split into the same phases the performance
+    // review asked about, so real per-phase timings are visible in-game
+    // instead of guessed: tooltip generation (getTooltipLines() itself),
+    // price extraction/parsing, profit calculation (source selection +
+    // color), border rendering, and cache lookup.
     private static volatile int totalTooltipParses = 0;
     private static volatile int cacheHitsThisScan = 0;
     private static volatile int cacheMissesThisScan = 0;
+    private static volatile long totalTooltipGenNanos = 0L;
+    private static volatile long totalParseNanos = 0L;
+    private static volatile long totalProfitCalcNanos = 0L;
+    private static volatile long totalBorderRenderNanos = 0L;
+    private static volatile long totalCacheLookupNanos = 0L;
 
     private static final int BORDER_THICKNESS = 2;
 
@@ -124,7 +150,8 @@ public final class ProfitRenderer {
     private static final int DEEP_RED_G = 20;
     private static final int DEEP_RED_B = 20;
 
-    private record SlotProfitEntry(
+    /** Pure pricing output for one evaluation - no cache-scheduling metadata. */
+    private record EvaluationResult(
             long price,
             long estimatedValue,
             int tintColor,
@@ -132,23 +159,54 @@ public final class ProfitRenderer {
             PriceSource autoSelectedSource
     ) {}
 
+    /**
+     * A slot's cached state, including retry-scheduling metadata.
+     * firstAttemptNanos/lastAttemptNanos drive the quick-retry-then-backoff
+     * schedule - see the class javadoc and renderSlotBackground.
+     */
+    private record SlotProfitEntry(
+            long price,
+            long estimatedValue,
+            int tintColor,
+            Map<PriceSource, Long> sourceValues,
+            PriceSource autoSelectedSource,
+            long firstAttemptNanos,
+            long lastAttemptNanos
+    ) {
+        boolean isPriced() {
+            return price > 0L && estimatedValue > 0L;
+        }
+    }
+
     private ProfitRenderer() {}
 
     /**
      * Called from the render mixin for every visible slot, every frame,
      * regardless of hover. This is what drives the eager full-page scan:
-     * each new (or invalidated) slot gets evaluated once, throttled to
-     * MAX_EVALUATIONS_PER_FRAME globally, and cached by slot index.
-     * Draws a 2px colored border on top of everything at the slot edges,
-     * leaving the center visible for rarity backgrounds from SkyHanni and
-     * the item icon.
+     * each new (or invalidated) slot gets evaluated once, throttled by a
+     * per-frame time budget rather than a fixed item count, and cached by
+     * slot index. Draws a 2px colored border on top of everything at the
+     * slot edges, leaving the center visible for rarity backgrounds from
+     * SkyHanni and the item icon.
      */
     public static void renderSlotBackground(GuiGraphicsExtractor guiGraphics, Slot slot) {
         if (slot == null) {
             return;
         }
 
-        OBSERVED_SLOTS.add(slot.index);
+        int slotIndex = slot.index;
+        if (slotIndex < 0 || slotIndex >= TOTAL_AH_SLOTS) {
+            // Some other "Auction"/"Auctions"/"BIN"-titled screen with a
+            // different slot layout than the standard 54-slot AH page (e.g.
+            // the create-listing screen) - skip it rather than risk an
+            // out-of-bounds cache access.
+            return;
+        }
+
+        if (!SLOT_OBSERVED[slotIndex]) {
+            SLOT_OBSERVED[slotIndex] = true;
+            observedSlotCount++;
+        }
         checkScanComplete();
 
         ItemStack stack = slot.getItem();
@@ -156,8 +214,10 @@ public final class ProfitRenderer {
             return;
         }
 
-        int slotIndex = slot.index;
-        SlotProfitEntry cached = SLOT_CACHE.get(slotIndex);
+        long lookupStart = System.nanoTime();
+        SlotProfitEntry cached = SLOT_CACHE[slotIndex];
+        boolean stableHit = cached != null && cached.isPriced();
+        totalCacheLookupNanos += System.nanoTime() - lookupStart;
 
         // Fast path: a stable cached result is trusted with no rebuild work
         // at all - not even a display-name read. Page-level invalidation is
@@ -165,21 +225,19 @@ public final class ProfitRenderer {
         // server-authoritative sync revision - see AbstractContainerMenuMixin)
         // and trackScreen (screen-instance identity), both of which clear
         // the whole cache the moment either signal fires, independently of
-        // this per-slot per-frame path. A per-frame fingerprint rebuild+
-        // compare here would just be re-detecting the same page change
-        // those two mechanisms already caught, for every one of 54 slots,
-        // every single frame.
+        // this per-slot per-frame path.
         //
         // Only trust a cached result if price data was actually found - NOT
         // just tintColor != 0, since a fully-resolved item can legitimately
         // have tintColor == 0 now (filtered out by the profitable-only or
         // minimum-profit settings). Checking price/estimatedValue directly
-        // keeps that case correctly treated as stable/cached, while a slot
-        // that genuinely found nothing yet (e.g. COFL's median not loaded
-        // yet) still keeps retrying on later frames.
-        if (cached != null && cached.price() > 0L && cached.estimatedValue() > 0L) {
+        // (via isPriced()) keeps that case correctly treated as stable/
+        // cached, while a slot that genuinely found nothing yet (e.g.
+        // COFL's median not loaded yet) still keeps retrying on later
+        // frames per the quick-retry/backoff schedule below.
+        if (stableHit) {
             cacheHitsThisScan++;
-            renderBorder(guiGraphics, slot, cached.tintColor());
+            renderBorderTimed(guiGraphics, slot, cached.tintColor());
             return;
         }
 
@@ -187,40 +245,44 @@ public final class ProfitRenderer {
             return;
         }
 
-        resetFrameCounterIfNewFrame();
+        resetFrameBudgetIfNewFrame();
 
-        // A slot's first-ever evaluation this scan cycle gets a much higher
-        // per-frame budget than retries, so a freshly opened/changed page
-        // fills in within a few frames instead of trickling in over ~18 -
-        // but capped, not fully uncapped, so one item that's slow to
-        // resolve (e.g. COFL falling back to fuzzy matching) only delays
-        // its own small batch instead of stalling the whole frame. RETRIES
-        // of a slot that already came back empty stay at the much lower
-        // MAX_EVALUATIONS_PER_FRAME - otherwise an item no price source
-        // tracks would get re-evaluated every single frame forever.
-        boolean isFirstAttempt = cached == null;
-        if (isFirstAttempt) {
-            if (firstPassEvaluationsThisFrame >= MAX_FIRST_PASS_EVALUATIONS_PER_FRAME) {
+        long now = System.nanoTime();
+        if (cached != null) {
+            boolean pastQuickRetryWindow = now - cached.firstAttemptNanos() > QUICK_RETRY_WINDOW_NANOS;
+            boolean dueForRetry = !pastQuickRetryWindow || now - cached.lastAttemptNanos() > RETRY_BACKOFF_NANOS;
+            if (!dueForRetry) {
                 return;
             }
-        } else if (evaluationsThisFrame >= MAX_EVALUATIONS_PER_FRAME) {
+        }
+
+        if (evalNanosThisFrame >= FRAME_EVAL_BUDGET_NANOS) {
+            // Out of this frame's evaluation budget - resume next frame.
+            // Slots already resolved by then are a near-free array lookup,
+            // so the budget effectively rolls forward onto whatever's left
+            // instead of restarting from slot 0 every frame.
             return;
         }
 
         cacheMissesThisScan++;
+        long evalStart = now;
         evaluating = true;
+        SlotProfitEntry entry;
         try {
-            SlotProfitEntry entry = evaluateFromTooltip(stack);
-            SLOT_CACHE.put(slotIndex, entry);
-            if (isFirstAttempt) {
-                firstPassEvaluationsThisFrame++;
-            } else {
-                evaluationsThisFrame++;
-            }
-            renderBorder(guiGraphics, slot, entry.tintColor());
+            EvaluationResult result = evaluateFromTooltip(stack);
+            long firstAttemptNanos = cached != null ? cached.firstAttemptNanos() : evalStart;
+            entry = new SlotProfitEntry(
+                    result.price(), result.estimatedValue(), result.tintColor(),
+                    result.sourceValues(), result.autoSelectedSource(),
+                    firstAttemptNanos, evalStart
+            );
+            SLOT_CACHE[slotIndex] = entry;
         } finally {
             evaluating = false;
         }
+        evalNanosThisFrame += System.nanoTime() - evalStart;
+
+        renderBorderTimed(guiGraphics, slot, entry.tintColor());
     }
 
     /**
@@ -242,9 +304,11 @@ public final class ProfitRenderer {
             return;
         }
 
-        SlotProfitEntry entry = hoveredSlotIndex >= 0 ? SLOT_CACHE.get(hoveredSlotIndex) : null;
+        SlotProfitEntry entry = (hoveredSlotIndex >= 0 && hoveredSlotIndex < TOTAL_AH_SLOTS)
+                ? SLOT_CACHE[hoveredSlotIndex]
+                : null;
 
-        if (entry != null && entry.price() > 0L && entry.estimatedValue() > 0L) {
+        if (entry != null && entry.isPriced()) {
             long netProfit = NetProfitCalculator.netProfit(entry.price(), entry.estimatedValue());
             double profitPercent = (double) netProfit / (double) entry.estimatedValue() * 100.0;
 
@@ -290,7 +354,7 @@ public final class ProfitRenderer {
             PriceSource selected
     ) {
         lines.add(Component.literal("\u00A76--- MarketUtils Debug ---"));
-        for (PriceSource source : PriceSource.values()) {
+        for (PriceSource source : PriceSource.VALUES) {
             long value = values.getOrDefault(source, 0L);
             String valueText = value > 0L ? formatAbsolute(value) : "N/A";
             lines.add(Component.literal("\u00A77" + source.displayName() + ": \u00A7f" + valueText));
@@ -311,14 +375,15 @@ public final class ProfitRenderer {
         }
     }
 
-    /** DEBUG mode: overall scan progress, independent of whether this specific item has been evaluated yet. */
+    /** DEBUG mode: overall scan progress and real per-phase timings, independent of whether this specific item has been evaluated yet. */
     private static void appendScanStats(List<Component> lines) {
-        int scanned = OBSERVED_SLOTS.size();
-        // price/estimatedValue > 0 means data was actually found, regardless
-        // of whether tintColor ended up 0 because it was filtered out.
-        long priced = SLOT_CACHE.values().stream()
-                .filter(e -> e.price() > 0L && e.estimatedValue() > 0L)
-                .count();
+        int scanned = observedSlotCount;
+        int priced = 0;
+        for (SlotProfitEntry e : SLOT_CACHE) {
+            if (e != null && e.isPriced()) {
+                priced++;
+            }
+        }
 
         lines.add(Component.literal("\u00A76--- MarketUtils Scan ---"));
         lines.add(Component.literal("\u00A77Slots scanned: \u00A7f" + scanned + "/" + TOTAL_AH_SLOTS));
@@ -335,6 +400,20 @@ public final class ProfitRenderer {
 
         lines.add(Component.literal("\u00A77Tooltip parses: \u00A7f" + totalTooltipParses));
         lines.add(Component.literal("\u00A77Cache hits/misses: \u00A7f" + cacheHitsThisScan + "/" + cacheMissesThisScan));
+
+        int evals = Math.max(totalTooltipParses, 1);
+        int lookups = Math.max(cacheHitsThisScan + cacheMissesThisScan, 1);
+        lines.add(Component.literal("\u00A76--- Phase timings (this page) ---"));
+        lines.add(Component.literal("\u00A77Tooltip gen: \u00A7f" + formatMillis(totalTooltipGenNanos)
+                + " total, " + formatMicros(totalTooltipGenNanos / evals) + " avg"));
+        lines.add(Component.literal("\u00A77Price extraction: \u00A7f" + formatMillis(totalParseNanos)
+                + " total, " + formatMicros(totalParseNanos / evals) + " avg"));
+        lines.add(Component.literal("\u00A77Profit calc: \u00A7f" + formatMillis(totalProfitCalcNanos)
+                + " total, " + formatMicros(totalProfitCalcNanos / evals) + " avg"));
+        lines.add(Component.literal("\u00A77Border render: \u00A7f" + formatMillis(totalBorderRenderNanos)
+                + " total, " + formatMicros(totalBorderRenderNanos / lookups) + " avg"));
+        lines.add(Component.literal("\u00A77Cache lookup: \u00A7f" + formatMillis(totalCacheLookupNanos)
+                + " total, " + formatMicros(totalCacheLookupNanos / lookups) + " avg"));
     }
 
     /**
@@ -377,15 +456,16 @@ public final class ProfitRenderer {
     }
 
     private static void checkScanComplete() {
-        if (!scanComplete && OBSERVED_SLOTS.size() >= TOTAL_AH_SLOTS) {
+        if (!scanComplete && observedSlotCount >= TOTAL_AH_SLOTS) {
             scanComplete = true;
             scanCompletedNanos = System.nanoTime();
         }
     }
 
     public static void clearCache() {
-        SLOT_CACHE.clear();
-        OBSERVED_SLOTS.clear();
+        Arrays.fill(SLOT_CACHE, null);
+        Arrays.fill(SLOT_OBSERVED, false);
+        observedSlotCount = 0;
         hoveredSlotIndex = -1;
         scanStartNanos = System.nanoTime();
         scanCompletedNanos = 0L;
@@ -393,15 +473,24 @@ public final class ProfitRenderer {
         totalTooltipParses = 0;
         cacheHitsThisScan = 0;
         cacheMissesThisScan = 0;
+        totalTooltipGenNanos = 0L;
+        totalParseNanos = 0L;
+        totalProfitCalcNanos = 0L;
+        totalBorderRenderNanos = 0L;
+        totalCacheLookupNanos = 0L;
     }
 
     // -- Internal evaluation --
 
-    private static SlotProfitEntry evaluateFromTooltip(ItemStack stack) {
+    private static EvaluationResult evaluateFromTooltip(ItemStack stack) {
+        long t0 = System.nanoTime();
         List<Component> tooltipLines = fetchFullTooltipLines(stack);
+        long t1 = System.nanoTime();
+        totalTooltipGenNanos += (t1 - t0);
         totalTooltipParses++;
+
         if (tooltipLines.isEmpty()) {
-            return new SlotProfitEntry(0L, 0L, 0, Map.of(), null);
+            return new EvaluationResult(0L, 0L, 0, Map.of(), null);
         }
 
         long price = 0L;
@@ -432,6 +521,8 @@ public final class ProfitRenderer {
 
             PriceProvider.accumulateSourceValues(lower, afterColon, sourceValues);
         }
+        long t2 = System.nanoTime();
+        totalParseNanos += (t2 - t1);
 
         // Computed unconditionally (not just in DEBUG mode) since it's cheap
         // and this is the one place it's safe to call getTooltipLines() -
@@ -444,11 +535,13 @@ public final class ProfitRenderer {
         long estimatedValue = PriceProvider.resolveValue(sourceValues, MarketUtilsConfig.getMode());
 
         if (price <= 0L || estimatedValue <= 0L) {
-            return new SlotProfitEntry(price, estimatedValue, 0, sourceValues, autoSelectedSource);
+            totalProfitCalcNanos += (System.nanoTime() - t2);
+            return new EvaluationResult(price, estimatedValue, 0, sourceValues, autoSelectedSource);
         }
 
         int color = computeTintColor(price, estimatedValue);
-        return new SlotProfitEntry(price, estimatedValue, color, sourceValues, autoSelectedSource);
+        totalProfitCalcNanos += (System.nanoTime() - t2);
+        return new EvaluationResult(price, estimatedValue, color, sourceValues, autoSelectedSource);
     }
 
     /**
@@ -502,6 +595,12 @@ public final class ProfitRenderer {
     }
 
     // -- Border rendering --
+
+    private static void renderBorderTimed(GuiGraphicsExtractor g, Slot slot, int color) {
+        long start = System.nanoTime();
+        renderBorder(g, slot, color);
+        totalBorderRenderNanos += System.nanoTime() - start;
+    }
 
     /**
      * Draws a colored border inside the slot edges. Only the 4 edge strips
@@ -610,12 +709,11 @@ public final class ProfitRenderer {
 
     // -- Frame throttling --
 
-    private static void resetFrameCounterIfNewFrame() {
+    private static void resetFrameBudgetIfNewFrame() {
         long now = System.nanoTime();
-        if (now - lastFrameStartNanos > 1_000_000L) {
-            evaluationsThisFrame = 0;
-            firstPassEvaluationsThisFrame = 0;
-            lastFrameStartNanos = now;
+        if (now - lastFrameTickNanos > 1_000_000L) {
+            evalNanosThisFrame = 0L;
+            lastFrameTickNanos = now;
         }
     }
 
@@ -655,5 +753,13 @@ public final class ProfitRenderer {
             return millis + "ms";
         }
         return String.format("%.1fs", millis / 1000.0);
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format("%.2fms", nanos / 1_000_000.0);
+    }
+
+    private static String formatMicros(long nanos) {
+        return String.format("%.1fus", nanos / 1_000.0);
     }
 }

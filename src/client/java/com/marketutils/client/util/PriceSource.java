@@ -11,6 +11,13 @@ public enum PriceSource {
     SKYHANNI("SkyHanni Value", "estimated item value:", "estimated value:", "est. value:", "est. item value:"),
     CRAFT_PRICE("Craft Price", "crafting price:", "craft price:");
 
+    /**
+     * enum.values() allocates a fresh array on every call - cached once here
+     * since this is walked once per tooltip LINE during scanning (see
+     * PriceProvider.accumulateSourceValues), not just once per item.
+     */
+    public static final PriceSource[] VALUES = values();
+
     private final String displayName;
     private final String[] labels;
 

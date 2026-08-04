@@ -43,7 +43,7 @@ public final class PriceProvider {
      *                   ready for PriceParser.parsePrice
      */
     public static void accumulateSourceValues(String lowerLine, String afterColon, Map<PriceSource, Long> values) {
-        for (PriceSource source : PriceSource.values()) {
+        for (PriceSource source : PriceSource.VALUES) {
             if (values.containsKey(source)) {
                 continue;
             }
