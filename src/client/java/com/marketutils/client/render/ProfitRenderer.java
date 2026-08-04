@@ -29,12 +29,16 @@ import java.util.Set;
  *
  * Caching strategy: every visible slot gets evaluated and cached by slot
  * index as soon as the AH screen renders it. Each slot's FIRST evaluation
- * this scan cycle is uncapped, so a freshly opened/changed page populates
- * in a single pass instead of trickling in - at the cost of a brief frame
- * stutter right on page open, favoring speed for flipping over smoothness.
- * Only RETRIES of a slot that came back empty (waiting on an async source
- * like COFL) are throttled to MAX_EVALUATIONS_PER_FRAME, so items nothing
- * ever prices don't get re-evaluated every frame forever. Hovering an item
+ * this scan cycle gets a much higher per-frame budget
+ * (MAX_FIRST_PASS_EVALUATIONS_PER_FRAME) than retries, so a freshly
+ * opened/changed page fills in within a few frames instead of trickling in
+ * over ~18 - not a single uncapped pass, since getTooltipLines() also runs
+ * every other mod's tooltip logic, and one item that's slow to resolve
+ * (e.g. COFL falling back to fuzzy matching) would otherwise stall the
+ * whole frame instead of just delaying its own small batch. RETRIES of a
+ * slot that came back empty (waiting on an async source like COFL) stay at
+ * the much lower MAX_EVALUATIONS_PER_FRAME, so items nothing ever prices
+ * don't get re-evaluated every frame forever. Hovering an item
  * only ever reads the cache - it never re-evaluates or re-parses tooltip
  * text on its own. The currently-hovered slot is tracked directly from
  * Minecraft's own hoveredSlot field (via the mixin), not by matching item
@@ -50,7 +54,18 @@ import java.util.Set;
 public final class ProfitRenderer {
 
     private static final int MAX_EVALUATIONS_PER_FRAME = 3;
+
+    // First-time evaluations get a much higher budget than retries so a
+    // fresh page fills in quickly, but NOT fully uncapped: getTooltipLines()
+    // fires every other mod's tooltip logic too, and an item COFL can't
+    // cleanly match (falls back to its slower fuzzy-match/estimate path)
+    // can take noticeably longer than a normal lookup. Evaluating all 54
+    // slots synchronously in one frame meant one slow item stalled the
+    // whole frame; capping it bounds that to one small batch instead.
+    private static final int MAX_FIRST_PASS_EVALUATIONS_PER_FRAME = 12;
+
     private static int evaluationsThisFrame = 0;
+    private static int firstPassEvaluationsThisFrame = 0;
     private static long lastFrameStartNanos = 0;
 
     private static boolean evaluating = false;
@@ -165,15 +180,21 @@ public final class ProfitRenderer {
             return;
         }
 
-        // A slot's first-ever evaluation this scan cycle runs immediately,
-        // uncapped, so a freshly opened/changed page populates in one pass
-        // instead of trickling in a few slots per frame. Only RETRIES of a
-        // slot that already came back empty are throttled - otherwise an
-        // item no price source tracks would get re-evaluated every single
-        // frame forever, which is a worse, permanent cost instead of one
-        // brief stutter on page open.
+        // A slot's first-ever evaluation this scan cycle gets a much higher
+        // per-frame budget than retries, so a freshly opened/changed page
+        // fills in within a few frames instead of trickling in over ~18 -
+        // but capped, not fully uncapped, so one item that's slow to
+        // resolve (e.g. COFL falling back to fuzzy matching) only delays
+        // its own small batch instead of stalling the whole frame. RETRIES
+        // of a slot that already came back empty stay at the much lower
+        // MAX_EVALUATIONS_PER_FRAME - otherwise an item no price source
+        // tracks would get re-evaluated every single frame forever.
         boolean isFirstAttempt = cached == null;
-        if (!isFirstAttempt && evaluationsThisFrame >= MAX_EVALUATIONS_PER_FRAME) {
+        if (isFirstAttempt) {
+            if (firstPassEvaluationsThisFrame >= MAX_FIRST_PASS_EVALUATIONS_PER_FRAME) {
+                return;
+            }
+        } else if (evaluationsThisFrame >= MAX_EVALUATIONS_PER_FRAME) {
             return;
         }
 
@@ -181,7 +202,9 @@ public final class ProfitRenderer {
         try {
             SlotProfitEntry entry = evaluateFromTooltip(stack, fingerprint);
             SLOT_CACHE.put(slotIndex, entry);
-            if (!isFirstAttempt) {
+            if (isFirstAttempt) {
+                firstPassEvaluationsThisFrame++;
+            } else {
                 evaluationsThisFrame++;
             }
             renderBorder(guiGraphics, slot, entry.tintColor());
@@ -564,6 +587,7 @@ public final class ProfitRenderer {
         long now = System.nanoTime();
         if (now - lastFrameStartNanos > 1_000_000L) {
             evaluationsThisFrame = 0;
+            firstPassEvaluationsThisFrame = 0;
             lastFrameStartNanos = now;
         }
     }
