@@ -1,18 +1,18 @@
 package com.marketutils.client.mixin;
 
 import com.marketutils.client.render.ProfitRenderer;
-import net.minecraft.client.gui.DrawContext;
-import net.minecraft.client.gui.screen.Screen;
-import net.minecraft.client.gui.screen.ingame.HandledScreen;
-import net.minecraft.entity.player.PlayerInventory;
-import net.minecraft.screen.slot.Slot;
-import net.minecraft.text.Text;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.world.inventory.Slot;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(HandledScreen.class)
+@Mixin(AbstractContainerScreen.class)
 public abstract class AbstractContainerScreenMixin {
 
     @Inject(method = "init", at = @At("TAIL"))
@@ -22,7 +22,7 @@ public abstract class AbstractContainerScreenMixin {
         }
     }
 
-    @Inject(method = "close", at = @At("HEAD"))
+    @Inject(method = "onClose", at = @At("HEAD"))
     private void clearProfitCacheOnScreenClose(CallbackInfo callbackInfo) {
         ProfitRenderer.clearCache();
     }
@@ -32,8 +32,8 @@ public abstract class AbstractContainerScreenMixin {
      * so the profit border renders ON TOP of SkyHanni's rarity background
      * color and the item icon, but only at the thin 2px edges.
      */
-    @Inject(method = "drawSlot", at = @At("TAIL"))
-    private void injectProfitOverlay(DrawContext drawContext, Slot inventorySlot, CallbackInfo callbackInfo) {
+    @Inject(method = "renderSlot", at = @At("TAIL"))
+    private void injectProfitOverlay(GuiGraphics guiGraphics, Slot inventorySlot, CallbackInfo callbackInfo) {
         if (inventorySlot == null) {
             return;
         }
@@ -42,17 +42,17 @@ public abstract class AbstractContainerScreenMixin {
             return;
         }
 
-        boolean isPlayerSlot = inventorySlot.inventory instanceof PlayerInventory;
+        boolean isPlayerSlot = inventorySlot.container instanceof Inventory;
         if (isPlayerSlot) {
             return;
         }
 
-        ProfitRenderer.renderSlotBackground(drawContext, inventorySlot);
+        ProfitRenderer.renderSlotBackground(guiGraphics, inventorySlot);
     }
 
     private boolean isAuctionScreen() {
         Screen screenInstance = (Screen) (Object) this;
-        Text titleComponent = screenInstance.getTitle();
+        Component titleComponent = screenInstance.getTitle();
         if (titleComponent == null) {
             return false;
         }
