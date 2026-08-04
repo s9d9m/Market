@@ -43,10 +43,15 @@ dependencies {
 	// any mappings dependency) fails with "Cannot use Mojang mappings in a
 	// non-obfuscated environment". Fabric API's own 0.155.2+26.1.2 build
 	// declares no mappings dependency either; omit it here to match.
-	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	// The "mod*" configurations only exist to remap a dependency's
+	// intermediary-mapped bytecode to named mappings - with no obfuscation
+	// there is nothing to remap, so Loom does not register them here.
+	// Fabric API's own build.gradle uses plain dependency configurations
+	// for the same reason.
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
-	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 }
 
 processResources {
