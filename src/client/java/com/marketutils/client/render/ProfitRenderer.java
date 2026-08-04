@@ -50,7 +50,9 @@ public final class ProfitRenderer {
             String fingerprint,
             long price,
             long estimatedValue,
-            int tintColor
+            int tintColor,
+            Map<PriceSource, Long> sourceValues,
+            PriceSource autoSelectedSource
     ) {}
 
     private ProfitRenderer() {}
@@ -81,7 +83,12 @@ public final class ProfitRenderer {
         String fingerprint = buildFingerprint(stack);
         SlotProfitEntry cached = SLOT_CACHE.get(slotIndex);
 
-        if (cached != null && cached.fingerprint().equals(fingerprint)) {
+        // Only trust a cached "no value" result if it actually found one.
+        // A source like COFL's median can take a moment to become available
+        // after login/screen-open (e.g. an async fetch not finished yet), so
+        // a slot that found nothing on its first evaluation must keep being
+        // retried on later frames rather than being stuck silent forever.
+        if (cached != null && cached.fingerprint().equals(fingerprint) && cached.tintColor() != 0) {
             renderBorder(guiGraphics, slot, cached.tintColor());
             return;
         }
@@ -184,7 +191,19 @@ public final class ProfitRenderer {
         }
 
         if (MarketUtilsConfig.getMode() == PricingMode.DEBUG) {
-            appendDebugBreakdown(stack, lines, price);
+            // Never call getTooltipLines() here - appendTooltipText runs
+            // from inside the callback that IS the tooltip being built, so
+            // asking for the tooltip again recurses infinitely and crashes.
+            // Use the cache (populated separately, safely, by
+            // evaluateFromTooltip via the render mixin) if it's ready yet;
+            // otherwise fall back to scanning the already-provided `lines`
+            // directly, which is safe since it's not a new fetch.
+            SlotProfitEntry cachedForDebug = findCachedEntryForStack(stack);
+            if (cachedForDebug != null) {
+                appendDebugBreakdown(lines, price, cachedForDebug.sourceValues(), cachedForDebug.autoSelectedSource());
+            } else {
+                appendDebugBreakdown(lines, price, PriceProvider.findAllValues(lines), PriceProvider.findAutoSource(lines));
+            }
         }
     }
 
@@ -195,15 +214,12 @@ public final class ProfitRenderer {
      * grading (which still uses PriceProvider.resolveValue like every other
      * mode).
      */
-    private static void appendDebugBreakdown(ItemStack stack, List<Component> lines, long price) {
-        List<Component> fullTooltipLines = fetchFullTooltipLines(stack);
-        if (fullTooltipLines.isEmpty()) {
-            return;
-        }
-
-        Map<PriceSource, Long> values = PriceProvider.findAllValues(fullTooltipLines);
-        PriceSource selected = PriceProvider.findAutoSource(fullTooltipLines);
-
+    private static void appendDebugBreakdown(
+            List<Component> lines,
+            long price,
+            Map<PriceSource, Long> values,
+            PriceSource selected
+    ) {
         lines.add(Component.literal("\u00A76--- MarketUtils Debug ---"));
         for (PriceSource source : PriceSource.values()) {
             long value = values.getOrDefault(source, 0L);
@@ -251,7 +267,7 @@ public final class ProfitRenderer {
     private static SlotProfitEntry evaluateFromTooltip(ItemStack stack, String fingerprint) {
         List<Component> tooltipLines = fetchFullTooltipLines(stack);
         if (tooltipLines.isEmpty()) {
-            return new SlotProfitEntry(fingerprint, 0L, 0L, 0);
+            return new SlotProfitEntry(fingerprint, 0L, 0L, 0, Map.of(), null);
         }
 
         long price = 0L;
@@ -272,16 +288,23 @@ public final class ProfitRenderer {
             }
         }
 
+        // Computed unconditionally (not just in DEBUG mode) since it's cheap
+        // and this is the one place it's safe to call getTooltipLines() -
+        // appendTooltipText must never re-fetch the tooltip itself, since
+        // it runs from inside the callback that's already building it.
+        Map<PriceSource, Long> sourceValues = PriceProvider.findAllValues(tooltipLines);
+        PriceSource autoSelectedSource = PriceProvider.findAutoSource(tooltipLines);
+
         // Estimated value comes from whichever source the current
         // PricingMode selects. See PriceProvider/PricingMode.
         long estimatedValue = PriceProvider.resolveValue(tooltipLines, MarketUtilsConfig.getMode());
 
         if (price <= 0L || estimatedValue <= 0L) {
-            return new SlotProfitEntry(fingerprint, price, estimatedValue, 0);
+            return new SlotProfitEntry(fingerprint, price, estimatedValue, 0, sourceValues, autoSelectedSource);
         }
 
         int color = computeTintColor(price, estimatedValue);
-        return new SlotProfitEntry(fingerprint, price, estimatedValue, color);
+        return new SlotProfitEntry(fingerprint, price, estimatedValue, color, sourceValues, autoSelectedSource);
     }
 
     /**
