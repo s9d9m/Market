@@ -109,7 +109,7 @@ public final class ProfitRenderer {
      * item, the tooltip text is derived from the cache. If not (e.g., the
      * item hasn't been rendered yet), we try parsing the provided lines.
      */
-    public static void appendTooltipComponent(ItemStack stack, List<Component> lines) {
+    public static void appendTooltipText(ItemStack stack, List<Component> lines) {
         if (stack == null || stack.isEmpty() || lines == null) {
             return;
         }
@@ -190,7 +190,7 @@ public final class ProfitRenderer {
 
     /**
      * Scans the slot cache for an entry whose fingerprint matches this
-     * stack's display name. Used by appendTooltipComponent to retrieve the
+     * stack's display name. Used by appendTooltipText to retrieve the
      * pre-computed price/value from the render path.
      */
     private static SlotProfitEntry findCachedEntryForStack(ItemStack stack) {
