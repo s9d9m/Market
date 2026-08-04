@@ -27,10 +27,14 @@ import java.util.Set;
  * rarity backgrounds remain visible) and appends debug text to tooltips.
  *
  * Caching strategy: every visible slot gets evaluated and cached by slot
- * index as soon as the AH screen renders it (throttled to
- * MAX_EVALUATIONS_PER_FRAME per frame, so a full 54-slot page settles in a
- * fraction of a second rather than costing a frame drop). Hovering an item
- * only ever reads that cache - it never re-evaluates or re-parses tooltip
+ * index as soon as the AH screen renders it. Each slot's FIRST evaluation
+ * this scan cycle is uncapped, so a freshly opened/changed page populates
+ * in a single pass instead of trickling in - at the cost of a brief frame
+ * stutter right on page open, favoring speed for flipping over smoothness.
+ * Only RETRIES of a slot that came back empty (waiting on an async source
+ * like COFL) are throttled to MAX_EVALUATIONS_PER_FRAME, so items nothing
+ * ever prices don't get re-evaluated every frame forever. Hovering an item
+ * only ever reads the cache - it never re-evaluates or re-parses tooltip
  * text on its own. The currently-hovered slot is tracked directly from
  * Minecraft's own hoveredSlot field (via the mixin), not by matching item
  * display names, so results can never be shown for the wrong slot.
@@ -131,7 +135,15 @@ public final class ProfitRenderer {
             return;
         }
 
-        if (evaluationsThisFrame >= MAX_EVALUATIONS_PER_FRAME) {
+        // A slot's first-ever evaluation this scan cycle runs immediately,
+        // uncapped, so a freshly opened/changed page populates in one pass
+        // instead of trickling in a few slots per frame. Only RETRIES of a
+        // slot that already came back empty are throttled - otherwise an
+        // item no price source tracks would get re-evaluated every single
+        // frame forever, which is a worse, permanent cost instead of one
+        // brief stutter on page open.
+        boolean isFirstAttempt = cached == null;
+        if (!isFirstAttempt && evaluationsThisFrame >= MAX_EVALUATIONS_PER_FRAME) {
             return;
         }
 
@@ -139,7 +151,9 @@ public final class ProfitRenderer {
         try {
             SlotProfitEntry entry = evaluateFromTooltip(stack, fingerprint);
             SLOT_CACHE.put(slotIndex, entry);
-            evaluationsThisFrame++;
+            if (!isFirstAttempt) {
+                evaluationsThisFrame++;
+            }
             renderBorder(guiGraphics, slot, entry.tintColor());
         } finally {
             evaluating = false;
