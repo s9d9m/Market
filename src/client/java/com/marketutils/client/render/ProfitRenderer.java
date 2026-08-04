@@ -1,6 +1,7 @@
 package com.marketutils.client.render;
 
 import com.marketutils.client.util.PriceParser;
+import com.marketutils.client.util.PriceProvider;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.world.inventory.Slot;
@@ -15,9 +16,10 @@ import java.util.Map;
 
 /**
  * Evaluates whether auction items are worth buying by comparing listing price
- * to SkyHanni's estimated value. Renders a colored BORDER around slots (so
- * SkyHanni's rarity backgrounds remain visible) and appends debug text to
- * tooltips.
+ * to an estimated value sourced via PriceProvider (COFL median, SkyBlocker,
+ * SkyHanni, or craft price, in that priority order). Renders a colored
+ * BORDER around slots (so SkyHanni's rarity backgrounds remain visible) and
+ * appends debug text to tooltips.
  *
  * Color scale is percentage-based:
  *   BIN far below estimated value  -> deep green border  (great deal)
@@ -140,20 +142,18 @@ public final class ProfitRenderer {
                     continue;
                 }
 
-                String afterColon = plain.substring(colon + 1);
-
                 if (price == 0L && isListingPriceLabel(lower)) {
-                    long parsed = PriceParser.parsePrice(afterColon);
+                    long parsed = PriceParser.parsePrice(plain.substring(colon + 1));
                     if (parsed > 0L) {
                         price = parsed;
                     }
-                } else if (isEstimatedValueLabel(lower)) {
-                    long parsed = PriceParser.parsePrice(afterColon);
-                    if (parsed > 0L) {
-                        estimatedValue = parsed;
-                    }
                 }
             }
+
+            // Estimated value comes from whichever compatible mod's line is
+            // present, in priority order: COFL median > SkyBlocker > SkyHanni
+            // > craft price. See PriceProvider for the priority chain.
+            estimatedValue = PriceProvider.findEstimatedValue(lines);
         }
 
         if (price > 0L && estimatedValue > 0L) {
@@ -218,7 +218,6 @@ public final class ProfitRenderer {
         );
 
         long price = 0L;
-        long estimatedValue = 0L;
 
         for (Component line : tooltipLines) {
             String plain = PriceParser.stripFormatting(line.getString());
@@ -228,20 +227,18 @@ public final class ProfitRenderer {
                 continue;
             }
 
-            String afterColon = plain.substring(colon + 1);
-
             if (price == 0L && isListingPriceLabel(lower)) {
-                long parsed = PriceParser.parsePrice(afterColon);
+                long parsed = PriceParser.parsePrice(plain.substring(colon + 1));
                 if (parsed > 0L) {
                     price = parsed;
                 }
-            } else if (isEstimatedValueLabel(lower)) {
-                long parsed = PriceParser.parsePrice(afterColon);
-                if (parsed > 0L) {
-                    estimatedValue = parsed;
-                }
             }
         }
+
+        // Estimated value comes from whichever compatible mod's line is
+        // present, in priority order: COFL median > SkyBlocker > SkyHanni
+        // > craft price. See PriceProvider for the priority chain.
+        long estimatedValue = PriceProvider.findEstimatedValue(tooltipLines);
 
         if (price <= 0L || estimatedValue <= 0L) {
             return new SlotProfitEntry(fingerprint, price, estimatedValue, 0);
@@ -280,17 +277,6 @@ public final class ProfitRenderer {
                 || lowerLine.contains("top bid:")
                 || lowerLine.contains("bin price:")
                 || lowerLine.contains("buy-it-now:");
-    }
-
-    /**
-     * Matches tooltip lines that contain the estimated item value from
-     * SkyHanni or similar mods.
-     */
-    private static boolean isEstimatedValueLabel(String lowerLine) {
-        return lowerLine.contains("estimated item value:")
-                || lowerLine.contains("estimated value:")
-                || lowerLine.contains("est. value:")
-                || lowerLine.contains("est. item value:");
     }
 
     // -- Border rendering --
