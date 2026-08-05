@@ -1,6 +1,7 @@
 package com.marketutils.client;
 
 import com.marketutils.client.render.ProfitRenderer;
+import com.marketutils.client.util.FilterMode;
 import com.marketutils.client.util.MarketUtilsConfig;
 import com.marketutils.client.util.PriceParser;
 import com.marketutils.client.util.PricingMode;
@@ -97,10 +98,77 @@ public class MarketutilsClient implements ClientModInitializer {
 								return Command.SINGLE_SUCCESS;
 							}));
 
+			var minRoiCommand = ClientCommands.literal("minroi")
+					.executes(context -> {
+						double threshold = MarketUtilsConfig.getMinimumRoiPercent();
+						String display = threshold == MarketUtilsConfig.NO_MINIMUM_ROI
+								? "disabled"
+								: threshold + "%";
+						context.getSource().sendFeedback(Component.literal(
+								"[MarketUtils] Minimum ROI threshold: " + display));
+						return Command.SINGLE_SUCCESS;
+					})
+					.then(ClientCommands.argument("value", StringArgumentType.word())
+							.executes(context -> {
+								String requested = StringArgumentType.getString(context, "value");
+
+								if (requested.equalsIgnoreCase("off") || requested.equalsIgnoreCase("none")) {
+									MarketUtilsConfig.setMinimumRoiPercent(MarketUtilsConfig.NO_MINIMUM_ROI);
+									ProfitRenderer.clearCache();
+									context.getSource().sendFeedback(Component.literal(
+											"[MarketUtils] Minimum ROI threshold disabled"));
+									return Command.SINGLE_SUCCESS;
+								}
+
+								String numeric = requested.endsWith("%")
+										? requested.substring(0, requested.length() - 1)
+										: requested;
+
+								double parsed;
+								try {
+									parsed = Double.parseDouble(numeric);
+								} catch (NumberFormatException e) {
+									context.getSource().sendError(Component.literal(
+											"[MarketUtils] Couldn't parse an ROI value from '" + requested
+													+ "'. Try something like 2, 5, 8, 10, 15, or 'off'."));
+									return Command.SINGLE_SUCCESS;
+								}
+
+								MarketUtilsConfig.setMinimumRoiPercent(parsed);
+								ProfitRenderer.clearCache();
+								context.getSource().sendFeedback(Component.literal(
+										"[MarketUtils] Minimum ROI threshold set to " + parsed + "%"));
+								return Command.SINGLE_SUCCESS;
+							}));
+
+			var filterModeCommand = ClientCommands.literal("filtermode")
+					.executes(context -> {
+						context.getSource().sendFeedback(Component.literal(
+								"[MarketUtils] Current filter mode: " + MarketUtilsConfig.getFilterMode()));
+						return Command.SINGLE_SUCCESS;
+					})
+					.then(ClientCommands.argument("value", StringArgumentType.word())
+							.executes(context -> {
+								String requested = StringArgumentType.getString(context, "value");
+								try {
+									FilterMode filterMode = FilterMode.valueOf(requested.toUpperCase());
+									MarketUtilsConfig.setFilterMode(filterMode);
+									ProfitRenderer.clearCache();
+									context.getSource().sendFeedback(Component.literal(
+											"[MarketUtils] Filter mode set to " + filterMode));
+								} catch (IllegalArgumentException e) {
+									context.getSource().sendError(Component.literal(
+											"[MarketUtils] Unknown filter mode. Valid modes: PROFIT_ONLY, ROI_ONLY, BOTH"));
+								}
+								return Command.SINGLE_SUCCESS;
+							}));
+
 			dispatcher.register(ClientCommands.literal("marketutils")
 					.then(modeCommand)
 					.then(profitableOnlyCommand)
-					.then(minProfitCommand));
+					.then(minProfitCommand)
+					.then(minRoiCommand)
+					.then(filterModeCommand));
 		});
 	}
 }

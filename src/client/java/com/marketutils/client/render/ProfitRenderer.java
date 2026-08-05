@@ -370,8 +370,10 @@ public final class ProfitRenderer {
         long selectedValue = values.get(selected);
         if (price > 0L && selectedValue > 0L) {
             long netProfit = NetProfitCalculator.netProfit(price, selectedValue);
-            lines.add(Component.literal("\u00A77Estimated Profit (net): \u00A7f" + formatNumber(netProfit)));
-            lines.add(Component.literal("\u00A77Would highlight: \u00A7f" + (shouldHighlight(netProfit) ? "Yes" : "No")));
+            double roiPercent = computeRoiPercent(netProfit, price);
+            lines.add(Component.literal("\u00A77Net Profit: \u00A7f" + formatNumber(netProfit)));
+            lines.add(Component.literal("\u00A77ROI: \u00A7f" + formatPercent(roiPercent)));
+            lines.add(Component.literal("\u00A77Would highlight: \u00A7f" + (shouldHighlight(netProfit, price) ? "Yes" : "No")));
         }
     }
 
@@ -635,8 +637,8 @@ public final class ProfitRenderer {
      *   near zero => neutral (yellow)
      *
      * Returns 0 (no border) if there's no valid price data, or if the
-     * profitable-only / minimum-profit-threshold settings filter this item
-     * out - see shouldHighlight.
+     * profitable-only / minimum-profit / minimum-ROI / filter-mode settings
+     * filter this item out - see shouldHighlight.
      */
     private static int computeTintColor(long price, long estimatedValue) {
         if (estimatedValue <= 0L || price <= 0L) {
@@ -645,7 +647,7 @@ public final class ProfitRenderer {
 
         long netProfit = NetProfitCalculator.netProfit(price, estimatedValue);
 
-        if (!shouldHighlight(netProfit)) {
+        if (!shouldHighlight(netProfit, price)) {
             return 0;
         }
 
@@ -698,13 +700,34 @@ public final class ProfitRenderer {
      * together - either one can suppress the border, matching how the
      * request described them as working together. Neither setting affects
      * the tooltip's worth-it text or DEBUG output, only border rendering.
+     *
+     * Beyond that, FilterMode picks which of the two threshold conditions
+     * below must ALSO be met: PROFIT_ONLY checks just the net profit
+     * threshold, ROI_ONLY checks just the ROI threshold, and BOTH requires
+     * both simultaneously (e.g. to rule out a huge-profit-but-poor-ROI
+     * flip, or a great-ROI-but-tiny-profit one). Each threshold's own
+     * NO_MINIMUM_* sentinel makes that threshold always-pass when unset, so
+     * switching FilterMode never surprises you with an unconfigured
+     * threshold silently blocking everything.
      */
-    private static boolean shouldHighlight(long netProfit) {
+    private static boolean shouldHighlight(long netProfit, long buyPrice) {
         if (MarketUtilsConfig.isProfitableOnly() && netProfit <= 0L) {
             return false;
         }
 
-        return netProfit >= MarketUtilsConfig.getMinimumProfitThreshold();
+        boolean meetsProfit = netProfit >= MarketUtilsConfig.getMinimumProfitThreshold();
+        boolean meetsRoi = computeRoiPercent(netProfit, buyPrice) >= MarketUtilsConfig.getMinimumRoiPercent();
+
+        return switch (MarketUtilsConfig.getFilterMode()) {
+            case PROFIT_ONLY -> meetsProfit;
+            case ROI_ONLY -> meetsRoi;
+            case BOTH -> meetsProfit && meetsRoi;
+        };
+    }
+
+    /** ROI (%) = net profit / buy price * 100. buyPrice is guaranteed > 0 by every caller (computeTintColor/appendDebugBreakdown both guard it first). */
+    private static double computeRoiPercent(long netProfit, long buyPrice) {
+        return (double) netProfit / (double) buyPrice * 100.0;
     }
 
     // -- Frame throttling --
@@ -753,6 +776,10 @@ public final class ProfitRenderer {
             return millis + "ms";
         }
         return String.format("%.1fs", millis / 1000.0);
+    }
+
+    private static String formatPercent(double percent) {
+        return String.format("%.1f%%", percent);
     }
 
     private static String formatMillis(long nanos) {
