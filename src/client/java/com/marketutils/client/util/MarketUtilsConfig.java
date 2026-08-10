@@ -13,8 +13,8 @@ public final class MarketUtilsConfig {
     /** Sentinel meaning "no minimum ROI threshold configured". */
     public static final double NO_MINIMUM_ROI = Double.NEGATIVE_INFINITY;
 
-    private static volatile PricingMode mode = PricingMode.AUTO;
-    private static volatile boolean profitableOnly = false;
+    private static volatile PricingMode mode = PricingMode.COFL_MEDIAN;
+    private static volatile boolean profitableOnly = true;
     private static volatile long minimumProfitThreshold = NO_MINIMUM_PROFIT;
     private static volatile double minimumRoiPercent = NO_MINIMUM_ROI;
 

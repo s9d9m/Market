@@ -12,6 +12,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.item.v1.ItemTooltipCallback;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.network.chat.Component;
 
 public class MarketutilsClient implements ClientModInitializer {
@@ -19,6 +20,32 @@ public class MarketutilsClient implements ClientModInitializer {
 	public void onInitializeClient() {
 		ItemTooltipCallback.EVENT.register((itemStack, tooltipContext, tooltipFlag, lines) -> {
 			ProfitRenderer.appendTooltipText(itemStack, lines);
+		});
+
+		// Config is in-memory only and resets to defaults (profitable-only
+		// ON, COFL_MEDIAN) every game restart - there's no world to send
+		// chat to yet in onInitializeClient, so the reminder to configure a
+		// threshold has to wait for the first world/server join. Only shown
+		// while neither threshold has been set this session, so it doesn't
+		// nag on every subsequent join once the player's configured one.
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+			if (client.player == null) {
+				return;
+			}
+
+			boolean profitConfigured = MarketUtilsConfig.getMinimumProfitThreshold() != MarketUtilsConfig.NO_MINIMUM_PROFIT;
+			boolean roiConfigured = MarketUtilsConfig.getMinimumRoiPercent() != MarketUtilsConfig.NO_MINIMUM_ROI;
+			if (profitConfigured || roiConfigured) {
+				return;
+			}
+
+			client.player.displayClientMessage(Component.literal(
+					"[MarketUtils] Loaded with defaults - Profitable-only: "
+							+ (MarketUtilsConfig.isProfitableOnly() ? "ON" : "OFF")
+							+ ", Pricing mode: " + MarketUtilsConfig.getMode()), false);
+			client.player.displayClientMessage(Component.literal(
+					"[MarketUtils] Set your desired minimum profit with /marketutils minprofit <value> (e.g. 5m) "
+							+ "or minimum ROI with /marketutils minroi <value> (e.g. 5%)"), false);
 		});
 
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
