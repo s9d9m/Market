@@ -1,0 +1,596 @@
+//@version=6
+// =============================================================================
+// 9:30 AM Opening Range Breakout (ORB) Testing Framework — 6E (Euro FX Futures)
+// =============================================================================
+// This is a PARAMETER-TESTING FRAMEWORK, not a claimed reproduction of any
+// specific back-tested return. The source video reports that, across ~90,000
+// tested variations on 5 years of data, the best-performing Euro FX (6E)
+// configuration was: Basic ORB (no retest/FVG/candle confirmation), a range
+// timeframe of 10 or 15 minutes, an entry timeframe higher than 1-5 minutes,
+// and a risk:reward ratio below 1:2. The video does NOT disclose the exact
+// range timeframe, entry timeframe, stop method, R:R, cutoff time, or risk
+// per trade that produced its headline number. (Note: the video itself states
+// two different figures for the same 5-year Euro result — "531%" near the
+// start and "630%" later on — so even the headline number is internally
+// inconsistent in the source material.)
+// Every one of those unknown parameters is exposed below as an input with a
+// clearly-labeled default. Nothing here should be read as "the winning
+// config" — it is a starting point for you to sweep and verify on your own
+// 6E data.
+// =============================================================================
+
+strategy("9:30 ORB Tester [6E] - Basic ORB Framework", shortTitle = "ORB6E",
+     overlay = true,
+     initial_capital = 100000,
+     currency = currency.USD,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = input.float(4.60, "Commission per contract, per order (USD)",
+         minval = 0.0, step = 0.01, group = "Commissions",
+         tooltip = "TradingView applies this amount PER ORDER (entry fill AND exit fill each incur it separately) — so a full round-trip trade costs 2x this value. The video used NinjaTrader commissions, which are NOT automatically the same as this. Enter your own broker's 6E per-side (per-contract, per-order) commission here. If your broker quotes a 'round turn' rate, divide it by 2 before entering it, since TradingView will charge it twice (once on entry, once on exit)."),
+     slippage = input.int(2, "Slippage (ticks, applied per order)",
+         minval = 0, maxval = 20, group = "Commissions",
+         tooltip = "The video used 1.5 ticks per trade. Pine Script's strategy() slippage parameter only accepts a WHOLE number of ticks and applies it to EVERY order (both entry and exit), not once per round trip. 1.5 cannot be entered directly — this rounds UP to 2 ticks by default so costs are not understated; set it to 1 if you'd rather round down, or 2 to stay conservative. This is disclosed here rather than silently approximated."),
+     pyramiding = 0,
+     process_orders_on_close = false,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     max_bars_back = 5000)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// ---- Session / Timezone -----------------------------------------------------
+sessionTZ    = input.string("America/New_York", "Session Timezone (IANA)", group = "Session",
+     tooltip = "All session-time logic (opening range start, cutoff) is computed in THIS timezone, not the chart's timezone, and automatically accounts for US Daylight Saving Time.")
+orStartHour  = input.int(9,  "Opening Range Start — Hour (0-23, local to Session Timezone)", minval = 0, maxval = 23, group = "Session")
+orStartMin   = input.int(30, "Opening Range Start — Minute", minval = 0, maxval = 59, group = "Session")
+
+// ---- Opening Range -----------------------------------------------------------
+rangeTFInput = input.string("15", "Range Timeframe (minutes)", options = ["5", "10", "15", "30"], group = "Opening Range",
+     tooltip = "Timeframe used to build the Opening Range High/Low, starting at the Session start time above. Default 15 is an UNVERIFIED DEFAULT — the video only says '10 or 15 minute performed better than 5 minute' for Euro, without naming the exact winner.")
+
+// ---- Entry Model --------------------------------------------------------------
+entryTFInput = input.string("15", "Entry Timeframe (minutes)", options = ["1", "5", "10", "15", "30"], group = "Entry Model",
+     tooltip = "Timeframe used to detect the breakout close and drive entries. Default 15 is an UNVERIFIED DEFAULT — the video only says entry TF should be 'higher than 1 or 5 minutes' for the best Euro result.")
+useRetest      = input.bool(false, "Require Retest Before Entry", group = "Entry Model",
+     tooltip = "OFF by default. The video's finding was that BASIC ORB (no retest) performed best on Euro. Turn this on only if you specifically want to test the retest variant.")
+useCandleConfirm = input.bool(false, "Require Candlestick Confirmation", group = "Entry Model",
+     tooltip = "OFF by default per the video's Basic ORB finding. When ON, the breakout (or retest, if enabled) candle must close bullish for longs / bearish for shorts.")
+useFVG         = input.bool(false, "Require Fair Value Gap on Breakout", group = "Entry Model",
+     tooltip = "OFF by default per the video's Basic ORB finding. When ON, a simple 3-bar imbalance must be present on the entry timeframe in the breakout direction.")
+cancelPendingAtCutoff = input.bool(true, "Cancel Unfilled Entry Order at Cutoff", group = "Entry Model")
+
+// ---- Stop Loss ------------------------------------------------------------
+stopMethodInput = input.string("Midpoint of Range", "Stop Loss Method",
+     options = ["Midpoint of Range", "Opposite Side of Range", "Retest Candle Wick"], group = "Stop Loss",
+     tooltip = "Default = Midpoint of Range: the most appropriate non-retest default since Basic ORB has no retest candle to reference. 'Retest Candle Wick' only functions correctly if 'Require Retest Before Entry' is enabled above; otherwise it silently falls back to Midpoint (a debug warning is shown when Debug Mode is on).")
+
+// ---- Take Profit / R:R -----------------------------------------------------
+rrInput = input.string("1:1.5", "Risk:Reward Ratio", options = ["1:1", "1:1.25", "1:1.5", "1:1.75", "1:2", "1:2.5", "1:3", "1:4"], group = "Take Profit",
+     tooltip = "Default 1:1.5 is an UNVERIFIED DEFAULT chosen only because the video states the best Euro R:R was 'lower than 1:2' — it does NOT reveal the exact figure. Sweep this input to find what actually works on your data.")
+
+// ---- Cutoff Time ------------------------------------------------------------
+cutoffInput = input.string("11:00", "Entry Cutoff Time (Session Timezone)", options = ["10:00", "11:00", "12:00", "13:00"], group = "Cutoff",
+     tooltip = "No NEW entry orders are placed after this time. Default 11:00 is an UNVERIFIED DEFAULT, one of the four cutoffs the video says it tested, not a claim about the winning value.")
+allowExistingPastCutoff = input.bool(true, "Let Already-Filled Trades Run to Stop/Target Past Cutoff", group = "Cutoff")
+
+// ---- Direction ------------------------------------------------------------
+enableLong  = input.bool(true, "Enable Long Trades", group = "Direction")
+enableShort = input.bool(true, "Enable Short Trades", group = "Direction")
+
+// ---- Trade Frequency --------------------------------------------------------
+maxTradesPerDay = input.int(1, "Max Trades Initiated Per Day", minval = 1, maxval = 10, group = "Trade Frequency")
+
+// ---- Risk / Position Sizing --------------------------------------------------
+riskModeInput   = input.string("Fixed Dollar Risk", "Risk Mode", options = ["Fixed Contracts", "Fixed Dollar Risk"], group = "Position Sizing")
+fixedContracts  = input.int(1, "Fixed Contracts (used if Risk Mode = Fixed Contracts)", minval = 1, group = "Position Sizing")
+riskPerTradeUSD = input.float(100.0, "Risk Per Trade (USD, used if Risk Mode = Fixed Dollar Risk)", minval = 1.0, group = "Position Sizing",
+     tooltip = "The video says risk per trade was held fixed but never states the dollar value. This is a testing input, not the video's actual setting.")
+tick6E      = input.float(0.00005, "6E Minimum Tick Size", minval = 0.00001, step = 0.00001, group = "Position Sizing", tooltip = "Standard CME 6E tick = 0.00005 (= $6.25/contract).")
+tickValue6E = input.float(6.25, "6E Tick Value (USD per contract per tick)", minval = 0.01, step = 0.01, group = "Position Sizing")
+
+// ---- Backtest Date Range ------------------------------------------------------
+startDate = input.time(timestamp(2021, 9, 8, 0, 0), "Backtest Start Date", group = "Backtest Range")
+endDate   = input.time(timestamp(2026, 9, 8, 23, 59), "Backtest End Date", group = "Backtest Range")
+
+// ---- Visualization / Debug ------------------------------------------------
+showORLines  = input.bool(true, "Show Opening Range Lines/Shading", group = "Visualization")
+showMarkers  = input.bool(true, "Show Entry/Stop/Target Markers", group = "Visualization")
+debugMode    = input.bool(false, "Enable Debug Mode (labels + live info panel)", group = "Visualization")
+
+// =============================================================================
+// DERIVED CONSTANTS
+// =============================================================================
+rangeTFMin = switch rangeTFInput
+    "5"  => 5
+    "10" => 10
+    "15" => 15
+    "30" => 30
+    => 15
+
+entryTFMin = switch entryTFInput
+    "1"  => 1
+    "5"  => 5
+    "10" => 10
+    "15" => 15
+    "30" => 30
+    => 15
+
+rrMultiple = switch rrInput
+    "1:1"    => 1.0
+    "1:1.25" => 1.25
+    "1:1.5"  => 1.5
+    "1:1.75" => 1.75
+    "1:2"    => 2.0
+    "1:2.5"  => 2.5
+    "1:3"    => 3.0
+    "1:4"    => 4.0
+    => 1.5
+
+cutoffHour = switch cutoffInput
+    "10:00" => 10
+    "11:00" => 11
+    "12:00" => 12
+    "13:00" => 13
+    => 11
+cutoffMinuteVal = 0
+
+// =============================================================================
+// SESSION TIME (explicit IANA timezone, DST-safe — no chart-timezone / UTC assumptions)
+// =============================================================================
+nyHour   = hour(time, sessionTZ)
+nyMinute = minute(time, sessionTZ)
+nyYear   = year(time, sessionTZ)
+nyMonth  = month(time, sessionTZ)
+nyDay    = dayofmonth(time, sessionTZ)
+
+nyTimeInMin       = nyHour * 60 + nyMinute
+orStartInMin      = orStartHour * 60 + orStartMin
+minutesSinceOpen  = nyTimeInMin - orStartInMin
+cutoffInMin       = cutoffHour * 60 + cutoffMinuteVal
+
+nyDateKey = nyYear * 10000 + nyMonth * 100 + nyDay
+isNewDay  = nyDateKey != nyDateKey[1]
+
+inDateRange = time >= startDate and time <= endDate
+
+// =============================================================================
+// STATE VARIABLES
+// =============================================================================
+var float orHigh = na
+var float orLow  = na
+var bool  orReady = false
+
+var float sHigh = na
+var float sLow  = na
+var float sOpen = na
+var float sClose = na
+var int   sBucketIdx = na
+
+var float lastClosedHigh  = na
+var float lastClosedLow   = na
+var float lastClosedOpen  = na
+var float lastClosedClose = na
+
+var int    tradesToday       = 0
+var bool   orderPendingToday = false
+var string pendingDir        = na   // "long" / "short"
+var bool   awaitingRetest    = false
+var float  breakoutRefHigh   = na
+var float  breakoutRefLow    = na
+var float  retestWickHigh    = na
+var float  retestWickLow     = na
+
+var float dayOrHighSnap = na
+var float dayOrLowSnap  = na
+var float dayOrMidSnap  = na
+
+var float activeStopPx = na
+var float activeTPPx   = na
+
+var array<float> riskQueue = array.new_float(0)
+
+// Stats
+var float sumRMultiple  = 0.0
+var int   rCount        = 0
+var float largestWin    = na
+var float largestLoss   = na
+var int   longTradeCount  = 0
+var int   shortTradeCount = 0
+var float maxEquitySeen  = 100000.0
+var float maxDrawdownPct = 0.0
+
+// Simplified FVG lookback (entry-timeframe synthetic bars, 2 bars back)
+var float fvg2High = na
+var float fvg2Low  = na
+var float fvg1High = na
+var float fvg1Low  = na
+
+// =============================================================================
+// DAILY RESET
+// =============================================================================
+if isNewDay
+    orHigh := na
+    orLow  := na
+    orReady := false
+    lastClosedHigh := na
+    lastClosedLow  := na
+    lastClosedOpen := na
+    lastClosedClose := na
+    sHigh := na
+    sLow := na
+    sOpen := na
+    sClose := na
+    sBucketIdx := na
+    tradesToday := 0
+    orderPendingToday := false
+    pendingDir := na
+    awaitingRetest := false
+    breakoutRefHigh := na
+    breakoutRefLow := na
+    retestWickHigh := na
+    retestWickLow := na
+    dayOrHighSnap := na
+    dayOrLowSnap := na
+    dayOrMidSnap := na
+    // Safety: cancel any stray resting orders from the prior day
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+// =============================================================================
+// OPENING RANGE CONSTRUCTION
+// (built purely from the current bar and earlier — no lookahead)
+// =============================================================================
+inORWindow = minutesSinceOpen >= 0 and minutesSinceOpen < rangeTFMin
+
+if inORWindow
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
+
+if not orReady and minutesSinceOpen >= rangeTFMin and not na(orHigh) and not na(orLow)
+    orReady := true
+    dayOrHighSnap := orHigh
+    dayOrLowSnap  := orLow
+    dayOrMidSnap  := (orHigh + orLow) / 2.0
+    if debugMode
+        label.new(bar_index, high, "OR ready\nH=" + str.tostring(dayOrHighSnap) + "\nL=" + str.tostring(dayOrLowSnap) + "\nMid=" + str.tostring(dayOrMidSnap),
+             style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
+
+// =============================================================================
+// SYNTHETIC ENTRY-TIMEFRAME BAR CONSTRUCTION
+// Built entirely from confirmed (already-closed) chart bars. The chart itself
+// must be run at a resolution <= the smallest of Range TF / Entry TF (a 1-minute
+// chart is recommended, see the written explanation) for this to be accurate.
+// A synthetic bar is only "closed" (usable for signals) once the bucket index
+// changes on a LATER bar — i.e. we only ever read data that has already printed.
+// =============================================================================
+curBucket = minutesSinceOpen >= 0 ? int(math.floor(minutesSinceOpen / entryTFMin)) : na
+
+bucketChanged = not na(curBucket) and (na(sBucketIdx) or curBucket != sBucketIdx)
+
+if bucketChanged
+    if not na(sHigh)
+        lastClosedHigh  := sHigh
+        lastClosedLow   := sLow
+        lastClosedOpen  := sOpen
+        lastClosedClose := sClose
+        fvg2High := fvg1High
+        fvg2Low  := fvg1Low
+        fvg1High := sHigh
+        fvg1Low  := sLow
+    sHigh := high
+    sLow := low
+    sOpen := open
+    sClose := close
+    sBucketIdx := curBucket
+else if not na(curBucket)
+    sHigh := math.max(sHigh, high)
+    sLow := math.min(sLow, low)
+    sClose := close
+
+// =============================================================================
+// ENTRY LOGIC
+// =============================================================================
+cutoffActive = nyTimeInMin <= cutoffInMin
+canInitiateToday = orReady and inDateRange and cutoffActive and tradesToday < maxTradesPerDay and not orderPendingToday and strategy.position_size == 0
+
+longBreakoutNow  = bucketChanged and not na(lastClosedClose) and lastClosedClose > dayOrHighSnap
+shortBreakoutNow = bucketChanged and not na(lastClosedClose) and lastClosedClose < dayOrLowSnap
+
+candleOKLong  = not useCandleConfirm or lastClosedClose > lastClosedOpen
+candleOKShort = not useCandleConfirm or lastClosedClose < lastClosedOpen
+
+fvgOKLong  = not useFVG or (not na(fvg2High) and lastClosedLow > fvg2High)
+fvgOKShort = not useFVG or (not na(fvg2Low) and lastClosedHigh < fvg2Low)
+
+// -- Stop-loss calc (based on the fixed OR snapshot for the day) --------------
+stopMethodEffective = stopMethodInput == "Retest Candle Wick" and not useRetest ? "Midpoint of Range" : stopMethodInput
+
+if stopMethodInput == "Retest Candle Wick" and not useRetest and debugMode and bucketChanged
+    label.new(bar_index, low, "Stop method 'Retest Candle Wick' requires\n'Require Retest Before Entry' = ON.\nFalling back to Midpoint.",
+         style = label.style_label_up, color = color.new(color.orange, 20), textcolor = color.black, size = size.small)
+
+longStopFor(wickLow) =>
+    switch stopMethodEffective
+        "Midpoint of Range"      => dayOrMidSnap
+        "Opposite Side of Range" => dayOrLowSnap
+        "Retest Candle Wick"     => wickLow
+        => dayOrMidSnap
+
+shortStopFor(wickHigh) =>
+    switch stopMethodEffective
+        "Midpoint of Range"      => dayOrMidSnap
+        "Opposite Side of Range" => dayOrHighSnap
+        "Retest Candle Wick"     => wickHigh
+        => dayOrMidSnap
+
+qtyForRisk(stopDist) =>
+    qty = 1
+    if riskModeInput == "Fixed Contracts"
+        qty := fixedContracts
+    else
+        ticks = stopDist / tick6E
+        dollarRiskPerContract = ticks * tickValue6E
+        qty := dollarRiskPerContract > 0 ? math.max(1, int(math.floor(riskPerTradeUSD / dollarRiskPerContract))) : 1
+    qty
+
+// -- Path A: Basic ORB (no retest) — resting limit order at the range edge ----
+if not useRetest and canInitiateToday
+    if enableLong and longBreakoutNow and candleOKLong and fvgOKLong
+        stopPx = longStopFor(float(na))
+        if not na(stopPx) and stopPx < dayOrHighSnap
+            stopDist = dayOrHighSnap - stopPx
+            qty = qtyForRisk(stopDist)
+            strategy.entry("Long", strategy.long, qty = qty, limit = dayOrHighSnap)
+            array.push(riskQueue, qty * (stopDist / tick6E) * tickValue6E)
+            orderPendingToday := true
+            pendingDir := "long"
+            tradesToday += 1
+            longTradeCount += 1
+            if debugMode
+                label.new(bar_index, high, "LONG order placed\nLimit=" + str.tostring(dayOrHighSnap) + "\nStop=" + str.tostring(stopPx) + "\nQty=" + str.tostring(qty),
+                     style = label.style_label_down, color = color.new(color.green, 20), textcolor = color.white, size = size.small)
+    else if enableShort and shortBreakoutNow and candleOKShort and fvgOKShort
+        stopPx = shortStopFor(float(na))
+        if not na(stopPx) and stopPx > dayOrLowSnap
+            stopDist = stopPx - dayOrLowSnap
+            qty = qtyForRisk(stopDist)
+            strategy.entry("Short", strategy.short, qty = qty, limit = dayOrLowSnap)
+            array.push(riskQueue, qty * (stopDist / tick6E) * tickValue6E)
+            orderPendingToday := true
+            pendingDir := "short"
+            tradesToday += 1
+            shortTradeCount += 1
+            if debugMode
+                label.new(bar_index, low, "SHORT order placed\nLimit=" + str.tostring(dayOrLowSnap) + "\nStop=" + str.tostring(stopPx) + "\nQty=" + str.tostring(qty),
+                     style = label.style_label_up, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+
+// -- Path B: Retest variant — arm on breakout, confirm on the retest bar's close, enter at market --
+// Arming counts as the day's "initiated" trade (mirrors Path A's order placement)
+// so a second setup cannot arm later in the same day even if this one never fills.
+if useRetest and canInitiateToday and not awaitingRetest
+    if enableLong and longBreakoutNow and candleOKLong and fvgOKLong
+        awaitingRetest := true
+        pendingDir := "long"
+        breakoutRefHigh := dayOrHighSnap
+        orderPendingToday := true
+        tradesToday += 1
+    else if enableShort and shortBreakoutNow and candleOKShort and fvgOKShort
+        awaitingRetest := true
+        pendingDir := "short"
+        breakoutRefLow := dayOrLowSnap
+        orderPendingToday := true
+        tradesToday += 1
+
+if useRetest and awaitingRetest and cutoffActive and bucketChanged and not na(lastClosedClose)
+    if pendingDir == "long"
+        retestHappened = lastClosedLow <= breakoutRefHigh and lastClosedClose > breakoutRefHigh
+        confirmOK = not useCandleConfirm or lastClosedClose > lastClosedOpen
+        if retestHappened and confirmOK
+            retestWickLow := lastClosedLow
+            stopPx = longStopFor(retestWickLow)
+            if not na(stopPx) and stopPx < close
+                stopDist = close - stopPx
+                qty = qtyForRisk(stopDist)
+                strategy.entry("Long", strategy.long, qty = qty)
+                array.push(riskQueue, qty * (stopDist / tick6E) * tickValue6E)
+                longTradeCount += 1
+                awaitingRetest := false
+                if debugMode
+                    label.new(bar_index, high, "LONG (retest) market entry\nStop=" + str.tostring(stopPx) + "\nQty=" + str.tostring(qty),
+                         style = label.style_label_down, color = color.new(color.green, 20), textcolor = color.white, size = size.small)
+    if pendingDir == "short"
+        retestHappened = lastClosedHigh >= breakoutRefLow and lastClosedClose < breakoutRefLow
+        confirmOK = not useCandleConfirm or lastClosedClose < lastClosedOpen
+        if retestHappened and confirmOK
+            retestWickHigh := lastClosedHigh
+            stopPx = shortStopFor(retestWickHigh)
+            if not na(stopPx) and stopPx > close
+                stopDist = stopPx - close
+                qty = qtyForRisk(stopDist)
+                strategy.entry("Short", strategy.short, qty = qty)
+                array.push(riskQueue, qty * (stopDist / tick6E) * tickValue6E)
+                shortTradeCount += 1
+                awaitingRetest := false
+                if debugMode
+                    label.new(bar_index, low, "SHORT (retest) market entry\nStop=" + str.tostring(stopPx) + "\nQty=" + str.tostring(qty),
+                         style = label.style_label_up, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+
+// -- Cutoff: stop watching for a retest, and (optionally) cancel unfilled resting orders --
+if not cutoffActive and awaitingRetest
+    awaitingRetest := false
+
+if cancelPendingAtCutoff and not cutoffActive and orderPendingToday and strategy.position_size == 0
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    if debugMode
+        label.new(bar_index, high, "Cutoff reached — unfilled order cancelled",
+             style = label.style_label_down, color = color.new(color.orange, 20), textcolor = color.black, size = size.small)
+
+// If configured to NOT let existing trades run past cutoff, flatten exactly on the
+// bar where the cutoff is crossed (never before — no lookahead into future bars).
+if not allowExistingPastCutoff and not cutoffActive and cutoffActive[1] and strategy.position_size != 0
+    strategy.close_all(comment = "Cutoff Flatten")
+    if debugMode
+        label.new(bar_index, close, "Cutoff reached — open position flattened",
+             style = label.style_label_down, color = color.new(color.orange, 20), textcolor = color.black, size = size.small)
+
+// =============================================================================
+// STOP / TARGET MANAGEMENT (computed from the ACTUAL fill price)
+// =============================================================================
+justEnteredLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+justEnteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if justEnteredLong
+    entryPx = strategy.opentrades.entry_price(strategy.opentrades - 1)
+    stopPx = longStopFor(retestWickLow)
+    stopDist = entryPx - stopPx
+    activeStopPx := stopPx
+    activeTPPx := entryPx + stopDist * rrMultiple
+
+if justEnteredShort
+    entryPx = strategy.opentrades.entry_price(strategy.opentrades - 1)
+    stopPx = shortStopFor(retestWickHigh)
+    stopDist = stopPx - entryPx
+    activeStopPx := stopPx
+    activeTPPx := entryPx - stopDist * rrMultiple
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry = "Long", stop = activeStopPx, limit = activeTPPx)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry = "Short", stop = activeStopPx, limit = activeTPPx)
+
+// =============================================================================
+// TRADE-CLOSE STATS (R multiple, largest win/loss, etc.)
+// =============================================================================
+if strategy.closedtrades > strategy.closedtrades[1]
+    idx = strategy.closedtrades - 1
+    profit = strategy.closedtrades.profit(idx)
+    riskDollar = array.size(riskQueue) > 0 ? array.shift(riskQueue) : na
+    if not na(riskDollar) and riskDollar > 0
+        rMult = profit / riskDollar
+        sumRMultiple += rMult
+        rCount += 1
+    if profit > 0
+        largestWin := na(largestWin) ? profit : math.max(largestWin, profit)
+    if profit < 0
+        largestLoss := na(largestLoss) ? profit : math.min(largestLoss, profit)
+    orderPendingToday := false
+
+// Max drawdown tracking (percent of running equity peak)
+maxEquitySeen := math.max(maxEquitySeen, strategy.equity)
+dd = maxEquitySeen > 0 ? (maxEquitySeen - strategy.equity) / maxEquitySeen * 100.0 : 0.0
+maxDrawdownPct := math.max(maxDrawdownPct, dd)
+
+// =============================================================================
+// VISUALIZATION
+// =============================================================================
+plot(showORLines and orReady ? dayOrHighSnap : na, title = "OR High", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 1)
+plot(showORLines and orReady ? dayOrLowSnap : na, title = "OR Low", color = color.new(color.maroon, 0), style = plot.style_linebr, linewidth = 1)
+plot(showORLines and orReady ? dayOrMidSnap : na, title = "OR Mid", color = color.new(color.gray, 40), style = plot.style_linebr, linewidth = 1)
+bgcolor(showORLines and inORWindow ? color.new(color.blue, 85) : na, title = "OR Formation Window")
+
+plotshape(showMarkers and justEnteredLong, title = "Long Entry", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
+plotshape(showMarkers and justEnteredShort, title = "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)
+plot(showMarkers and strategy.position_size != 0 ? activeStopPx : na, title = "Active Stop", color = color.new(color.red, 0), style = plot.style_circles)
+plot(showMarkers and strategy.position_size != 0 ? activeTPPx : na, title = "Active Target", color = color.new(color.green, 0), style = plot.style_circles)
+
+// =============================================================================
+// PERFORMANCE DASHBOARD
+// =============================================================================
+if barstate.islast
+    perfTable = table.new(position.top_right, 2, 16, border_width = 1, bgcolor = color.new(color.black, 70), border_color = color.gray)
+    closedT = strategy.closedtrades
+    winT = strategy.wintrades
+    lossT = strategy.losstrades
+    netProfit = strategy.netprofit
+    netProfitPct = strategy.initial_capital != 0 ? netProfit / strategy.initial_capital * 100.0 : na
+    winRate = closedT > 0 ? winT / closedT * 100.0 : na
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    avgTrade = closedT > 0 ? netProfit / closedT : na
+    avgWin = winT > 0 ? strategy.grossprofit / winT : na
+    avgLoss = lossT > 0 ? strategy.grossloss / lossT : na
+    avgR = rCount > 0 ? sumRMultiple / rCount : na
+
+    row = 0
+    table.cell(perfTable, 0, row, "Metric", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(perfTable, 1, row, "Value", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    row += 1
+    table.cell(perfTable, 0, row, "Net Profit")
+    table.cell(perfTable, 1, row, str.tostring(netProfit, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Net Profit %")
+    table.cell(perfTable, 1, row, na(netProfitPct) ? "-" : str.tostring(netProfitPct, "#.##") + "%")
+    row += 1
+    table.cell(perfTable, 0, row, "Total Trades")
+    table.cell(perfTable, 1, row, str.tostring(closedT))
+    row += 1
+    table.cell(perfTable, 0, row, "Winning Trades")
+    table.cell(perfTable, 1, row, str.tostring(winT))
+    row += 1
+    table.cell(perfTable, 0, row, "Losing Trades")
+    table.cell(perfTable, 1, row, str.tostring(lossT))
+    row += 1
+    table.cell(perfTable, 0, row, "Win Rate")
+    table.cell(perfTable, 1, row, na(winRate) ? "-" : str.tostring(winRate, "#.##") + "%")
+    row += 1
+    table.cell(perfTable, 0, row, "Profit Factor")
+    table.cell(perfTable, 1, row, na(profitFactor) ? "-" : str.tostring(profitFactor, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Average Trade")
+    table.cell(perfTable, 1, row, na(avgTrade) ? "-" : str.tostring(avgTrade, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Average Winner")
+    table.cell(perfTable, 1, row, na(avgWin) ? "-" : str.tostring(avgWin, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Average Loser")
+    table.cell(perfTable, 1, row, na(avgLoss) ? "-" : str.tostring(avgLoss, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Max Drawdown %")
+    table.cell(perfTable, 1, row, str.tostring(maxDrawdownPct, "#.##") + "%")
+    row += 1
+    table.cell(perfTable, 0, row, "Average R Multiple")
+    table.cell(perfTable, 1, row, rCount > 0 ? str.tostring(avgR, "#.##") + "R" : "-")
+    row += 1
+    table.cell(perfTable, 0, row, "Largest Winner")
+    table.cell(perfTable, 1, row, na(largestWin) ? "-" : str.tostring(largestWin, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Largest Loser")
+    table.cell(perfTable, 1, row, na(largestLoss) ? "-" : str.tostring(largestLoss, "#.##"))
+    row += 1
+    table.cell(perfTable, 0, row, "Long / Short Trades")
+    table.cell(perfTable, 1, row, str.tostring(longTradeCount) + " / " + str.tostring(shortTradeCount))
+
+// =============================================================================
+// DEBUG PANEL (current bar snapshot)
+// =============================================================================
+if debugMode and barstate.islast
+    dbgTable = table.new(position.bottom_right, 2, 10, border_width = 1, bgcolor = color.new(color.navy, 70), border_color = color.gray)
+    drow = 0
+    table.cell(dbgTable, 0, drow, "Debug", text_color = color.white, bgcolor = color.new(color.blue, 40))
+    table.cell(dbgTable, 1, drow, "", bgcolor = color.new(color.blue, 40))
+    drow += 1
+    table.cell(dbgTable, 0, drow, "NY Time")
+    table.cell(dbgTable, 1, drow, str.tostring(nyHour) + ":" + str.tostring(nyMinute))
+    drow += 1
+    table.cell(dbgTable, 0, drow, "OR Start")
+    table.cell(dbgTable, 1, drow, str.tostring(orStartHour) + ":" + str.tostring(orStartMin))
+    drow += 1
+    table.cell(dbgTable, 0, drow, "OR End (+" + str.tostring(rangeTFMin) + "m)")
+    table.cell(dbgTable, 1, drow, str.tostring(orStartInMin + rangeTFMin))
+    drow += 1
+    table.cell(dbgTable, 0, drow, "OR High / Low")
+    table.cell(dbgTable, 1, drow, (na(dayOrHighSnap) ? "-" : str.tostring(dayOrHighSnap)) + " / " + (na(dayOrLowSnap) ? "-" : str.tostring(dayOrLowSnap)))
+    drow += 1
+    table.cell(dbgTable, 0, drow, "Breakout Dir")
+    table.cell(dbgTable, 1, drow, na(pendingDir) ? "-" : pendingDir)
+    drow += 1
+    table.cell(dbgTable, 0, drow, "Cutoff Active")
+    table.cell(dbgTable, 1, drow, cutoffActive ? "yes" : "no")
+    drow += 1
+    table.cell(dbgTable, 0, drow, "Trades Today")
+    table.cell(dbgTable, 1, drow, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay))
+    drow += 1
+    table.cell(dbgTable, 0, drow, "Position")
+    table.cell(dbgTable, 1, drow, str.tostring(strategy.position_size))
